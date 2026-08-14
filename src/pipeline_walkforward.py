@@ -1,0 +1,2068 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+# -*- coding: utf-8 -*-
+"""
+Pipeline completo, walk-forward, base ElasticNet + camada CatBoost,
+para previsao diaria de internacoes por doencas respiratorias em Sao Paulo.
+Versao final com figuras suplementares.
+
+Acrescimos em relacao a versao anterior:
+- fig34_caracterizacao_HOSPCIDX_serie_diaria
+- fig35_caracterizacao_12_variaveis_ambientais
+- fig36_matriz_correlacao_preditoras_HOSPCIDX
+- fig37_zoom_pandemia_1T2020
+- fig38_zoom_pandemia_pico_mai_jun_2020
+- fig39_zoom_recuperacao_2022
+- fig40_modelo_vs_baselines_zoom_pandemia
+- fig41_qq_plot_residuos
+- fig42_shap_dependence_CO
+- fig43_shap_dependence_NO2
+- fig44_boxplot_mensal_PM2_5
+- fig45_boxplot_mensal_TEMPMED
+- fig46_boxplot_mensal_CO
+- fig47_diagrama_PRISMA_revisao_sistematica
+
+Todas as novas figuras sao geradas dentro da mesma pasta de saida ja usada
+pelo pipeline, em Downloads, no mesmo run_folder com timestamp.
+"""
+
+import os
+import sys
+import json
+import time
+import warnings
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple, List
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+import numpy as np
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge, ElasticNet
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from scipy import stats as scipy_stats
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0) AUTO-INSTALL
+# ============================================================
+
+AUTO_INSTALL_CATBOOST = True
+AUTO_INSTALL_OPTUNA = False
+
+
+def _pip_install(pkg: str) -> bool:
+    try:
+        print(f"[pip] Instalando {pkg} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+        return True
+    except Exception as e:
+        print(f"[pip] Falha ao instalar {pkg}: {e}")
+        return False
+
+
+HAVE_CATBOOST = False
+CatBoostRegressor = None
+Pool = None
+try:
+    from catboost import CatBoostRegressor, Pool  # type: ignore
+    HAVE_CATBOOST = True
+except Exception:
+    if AUTO_INSTALL_CATBOOST and _pip_install("catboost"):
+        from catboost import CatBoostRegressor, Pool  # type: ignore
+        HAVE_CATBOOST = True
+
+HAVE_OPTUNA = False
+optuna = None
+try:
+    import optuna  # type: ignore
+    HAVE_OPTUNA = True
+except Exception:
+    if AUTO_INSTALL_OPTUNA and _pip_install("optuna"):
+        import optuna  # type: ignore
+        HAVE_OPTUNA = True
+
+# ============================================================
+# 1) CONFIG
+# ============================================================
+
+EXCEL_PATH = r"C:\Users\Usuario\Desktop\0_ArPol_VarMet_Hosp_Mort_2017a2022_SP_CENARIO_COVID_ONDAS_TODOS_HOSP_MORT_CLEAN.xlsx"
+SHEET_NAME = None
+DATE_COL = None
+TARGET_COL = "HOSPCIDX"
+
+RAW_FEATURES = [
+    "PM10", "PM2_5", "O3", "NO2", "SO2", "CO",
+    "TEMPMED", "UMIDRELAT", "PRECIPIT", "RADIACAO", "VELVENTO", "PRESSAOATM"
+]
+
+BACKTEST_START = None
+BACKTEST_END = None
+TEST_START = "2018-01-01"
+TEST_END = None
+FOLD_MONTHS = 2
+INNER_VAL_DAYS = 75
+PANDEMIC_START = "2020-03-01"
+
+RANDOM_SEED = 42
+SAVE_TO_DOWNLOADS = True
+USE_TIMESTAMP_RUNFOLDER = True
+RUN_FOLDER_NAME_PREFIX = "walkforward_R20_GPT3_SURGICAL_ENV_ONLY"
+
+RUN_HPO = False
+MAX_TRIALS = 8
+TIME_BUDGET_HOURS = 0.7
+OPTUNA_DB_PATH = "optuna_walkforward_r20_gpt3_surgical_env_only.db"
+OPTUNA_STUDY_NAME = "walkforward_r20_gpt3_surgical_env_only"
+OPTUNA_N_JOBS = 1
+HPO_FAST_FOLDS = 6
+
+CAT_ITER_HPO = 350
+CAT_EARLY_STOP_HPO = 45
+CAT_ITER_FINAL = 1200
+CAT_EARLY_STOP_FINAL = 90
+FINAL_REFIT_VAL_DAYS = 45
+
+USE_FINAL_ENSEMBLE = True
+FINAL_ENSEMBLE_SEEDS = [42, 52]
+
+DIRECT_BLEND_GRID = [0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 1.0]
+MIN_REL_IMPROVEMENT_TO_REPLACE_BASE = 0.005
+
+SHOW_FIGS = False
+SHOW_BLOCKING = False
+SAVE_FIGS_AS_PDF = True
+FIGURES_SUBDIR = "figures_env_meteo_only"
+SHAP_CLASSIC_TOPK = 12
+EXPLAINABILITY_ONLY_RAW_ENV = True
+
+# ============================================================
+# 2) CURATED CONFIG
+# ============================================================
+
+CURATED_CFG = {
+    "exog_fill_mode": "ffill_rolling",
+    "exog_ffill_limit": 7,
+    "add_missing_flags": True,
+    "exog_feature_set": "raw_lags_light",
+    "exog_known_lag_days": 0,
+    "base_model_kind": "elasticnet",
+    "base_alpha": 0.0045,
+    "elastic_l1_ratio": 0.08,
+    "target_lags": (1, 2, 3, 4, 5, 6, 7, 10, 14, 21, 28, 35, 42, 56, 84, 364, 365),
+    "roll_windows": (7, 14, 28),
+    "add_context": True,
+    "add_basepred": True,
+    "add_seasonal_baseline": True,
+    "use_recency_weights": True,
+    "recency_weight_power": 1.25,
+    "depth": 6,
+    "learning_rate": 0.030,
+    "l2_leaf_reg": 3.0,
+    "subsample": 0.85,
+    "rsm": 0.85,
+    "min_data_in_leaf": 40,
+    "random_strength": 0.40,
+    "bootstrap_type": "Bayesian",
+    "bagging_temperature": 1.0,
+    "border_count": 128,
+    "cat_loss_kind": "RMSE",
+}
+CURATED_CFG["cat_loss"] = "RMSE"
+
+# ============================================================
+# 3) UTILS
+# ============================================================
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def _norm_key(x: str) -> str:
+    s = str(x).strip().lower()
+    return "".join([ch for ch in s if ch.isalnum()])
+
+
+def rmse(y_true, y_pred) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def safe_clip_nonneg(x):
+    x = np.asarray(x, dtype=float)
+    return np.clip(x, 0.0, None)
+
+
+def metrics_all(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    mae = mean_absolute_error(y_true, y_pred)
+    _rmse = rmse(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+
+    eps = 1e-9
+    denom = np.maximum(np.abs(y_true), eps)
+    mape = np.mean(np.abs((y_true - y_pred) / denom)) * 100.0
+
+    yt = np.clip(y_true, 0.0, None)
+    yp = np.clip(y_pred, 0.0, None)
+    rmsle = float(np.sqrt(mean_squared_error(np.log1p(yt), np.log1p(yp))))
+
+    return {
+        "MAE": float(mae),
+        "RMSE": float(_rmse),
+        "R2": float(r2),
+        "MAPE_%": float(mape),
+        "RMSLE": float(rmsle),
+    }
+
+
+def guess_date_col(df: pd.DataFrame) -> str:
+    candidates = []
+    for c in df.columns:
+        cl = str(c).lower()
+        if ("data" in cl) or ("date" in cl) or ("dia" in cl):
+            candidates.append(c)
+
+    def ok_parse(col):
+        try:
+            s = pd.to_datetime(df[col], errors="coerce")
+            return s.notna().mean() > 0.90
+        except Exception:
+            return False
+
+    for c in candidates:
+        if ok_parse(c):
+            return c
+    for c in df.columns:
+        if ok_parse(c):
+            return c
+    raise ValueError("Nao consegui identificar a coluna de data. Defina DATE_COL manualmente.")
+
+
+def map_and_rename_raw_columns(df: pd.DataFrame, raw_features: list) -> pd.DataFrame:
+    col_map = {_norm_key(c): c for c in df.columns}
+    rename_dict = {}
+
+    for feat in raw_features:
+        key = _norm_key(feat)
+        if feat in df.columns:
+            continue
+        if key in col_map:
+            actual = col_map[key]
+            if actual != feat:
+                rename_dict[actual] = feat
+            continue
+
+        synonyms = {
+            "pm2_5": ["pm25", "pm2p5", "pm2.5", "pm2,5", "pm_2_5", "pm2_5", "pm 2,5", "pm 2.5"],
+        }
+        if key in synonyms:
+            found = None
+            for syn in synonyms[key]:
+                syn_key = _norm_key(syn)
+                if syn_key in col_map:
+                    found = col_map[syn_key]
+                    break
+            if found is not None:
+                rename_dict[found] = feat
+                continue
+
+        raise ValueError(f"Faltou coluna RAW no Excel: '{feat}'.")
+
+    if rename_dict:
+        df = df.rename(columns=rename_dict)
+    return df
+
+
+def make_folds_bymonths(index, test_start=None, test_end=None, months=2):
+    idx_min = pd.Timestamp(index.min()).normalize()
+    idx_max = pd.Timestamp(index.max()).normalize()
+
+    ts = pd.Timestamp(test_start).normalize() if test_start else (idx_min + pd.DateOffset(years=1)).normalize()
+    te = pd.Timestamp(test_end).normalize() if test_end else idx_max
+    ts = (ts + pd.offsets.MonthBegin(0)).normalize()
+
+    folds = []
+    fold_id = 1
+    cur = ts
+    while cur <= te:
+        test_start_dt = cur
+        test_end_dt = (cur + pd.DateOffset(months=months)) - pd.Timedelta(days=1)
+        if test_end_dt > te:
+            test_end_dt = te
+        train_end_dt = test_start_dt - pd.Timedelta(days=1)
+        folds.append({
+            "fold": fold_id,
+            "train_end": train_end_dt,
+            "test_start": test_start_dt,
+            "test_end": test_end_dt,
+        })
+        fold_id += 1
+        cur = (test_end_dt + pd.offsets.MonthBegin(1)).normalize()
+    return folds
+
+
+def get_downloads_dir() -> Path:
+    home = Path(os.environ.get("USERPROFILE", str(Path.home())))
+    candidates = [
+        home / "Downloads",
+        home / "Download",
+        home / "OneDrive" / "Downloads",
+        home / "OneDrive" / "Download",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return home / "Downloads"
+
+
+def pandemic_flag(dti: pd.DatetimeIndex, start=PANDEMIC_START):
+    start = pd.Timestamp(start)
+    return (pd.DatetimeIndex(dti) >= start).astype(int)
+
+
+def build_out_dir(tag: str) -> str:
+    if SAVE_TO_DOWNLOADS:
+        downloads = get_downloads_dir()
+        run_tag = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S") if USE_TIMESTAMP_RUNFOLDER else ""
+        name = f"{RUN_FOLDER_NAME_PREFIX}_{tag}" + (f"_{run_tag}" if run_tag else "")
+        return str(downloads / name)
+    return str(Path("reports_walkforward") / f"{RUN_FOLDER_NAME_PREFIX}_{tag}")
+
+
+def make_time_weights(index: pd.DatetimeIndex, min_w: float = 0.85, max_w: float = 1.20, power: float = 1.25) -> np.ndarray:
+    n = len(index)
+    if n <= 1:
+        return np.ones(n, dtype=float)
+    z = np.linspace(0.0, 1.0, n) ** float(power)
+    return np.asarray(float(min_w) + (float(max_w) - float(min_w)) * z, dtype=float)
+
+
+def causal_fill_exog_frame(df_exog: pd.DataFrame, ffill_limit: int = 7, roll_window: int = 21) -> pd.DataFrame:
+    X = df_exog.copy()
+    X = X.ffill(limit=int(ffill_limit))
+    for c in X.columns:
+        med = X[c].shift(1).rolling(int(roll_window), min_periods=3).median()
+        X[c] = X[c].fillna(med)
+    return X
+
+
+def set_pub_style():
+    plt.rcParams.update({
+        "figure.dpi": 120,
+        "savefig.dpi": 300,
+        "font.size": 11,
+        "axes.titlesize": 12,
+        "axes.labelsize": 11,
+        "legend.fontsize": 10,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "grid.linewidth": 0.6,
+        "axes.linewidth": 0.8,
+        "lines.linewidth": 1.2,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+
+def save_fig(fig, fig_dir: str, name: str):
+    ensure_dir(fig_dir)
+    png_path = os.path.join(fig_dir, f"{name}.png")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+
+    pdf_path = None
+    if SAVE_FIGS_AS_PDF:
+        pdf_path = os.path.join(fig_dir, f"{name}.pdf")
+        fig.savefig(pdf_path, bbox_inches="tight")
+
+    if SHOW_FIGS:
+        plt.show(block=bool(SHOW_BLOCKING))
+        if not SHOW_BLOCKING:
+            plt.pause(0.001)
+
+    plt.close(fig)
+    return png_path, pdf_path
+
+
+def _month_labels_pt():
+    return ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+
+def select_representative_hpo_folds(folds: List[Dict[str, Any]], n_select: int = 6) -> List[Dict[str, Any]]:
+    if len(folds) <= n_select:
+        return folds
+    picks = set(np.round(np.linspace(0, len(folds) - 1, n_select)).astype(int).tolist())
+    for dt in [pd.Timestamp("2020-03-01"), pd.Timestamp("2021-01-01"), pd.Timestamp("2022-01-01")]:
+        distances = [abs((pd.Timestamp(f["test_start"]) - dt).days) for f in folds]
+        picks.add(int(np.argmin(distances)))
+    return [folds[i] for i in sorted(picks)]
+
+
+def seasonal_baseline_from_hist(y_hist: pd.Series, date: pd.Timestamp) -> float:
+    vals = []
+    for lag in (364, 365):
+        v = y_hist.shift(lag).get(date, np.nan)
+        if pd.notna(v):
+            vals.append(float(v))
+    if len(vals) == 0:
+        return np.nan
+    return float(np.mean(vals))
+
+
+def choose_best_strategy_on_validation(y_true, pred_base, pred_residual, pred_direct, pred_blend):
+    y_true = np.asarray(y_true, dtype=float)
+    candidates = {
+        "base_only": safe_clip_nonneg(pred_base),
+        "residual_only": safe_clip_nonneg(pred_residual),
+        "direct_only": safe_clip_nonneg(pred_direct),
+        "blend": safe_clip_nonneg(pred_blend),
+    }
+    scores = {k: rmse(y_true, v) for k, v in candidates.items()}
+    base_rmse = float(scores["base_only"])
+    best_name = min(scores, key=scores.get)
+    best_rmse = float(scores[best_name])
+
+    if best_name != "base_only":
+        rel_gain = (base_rmse - best_rmse) / base_rmse if base_rmse > 0 else 0.0
+        if rel_gain < MIN_REL_IMPROVEMENT_TO_REPLACE_BASE:
+            best_name = "base_only"
+            best_rmse = base_rmse
+
+    return best_name, best_rmse, scores
+
+
+def choose_best_blend_weight(y_true, pred_residual, pred_direct, pred_base, grid=None):
+    if grid is None:
+        grid = DIRECT_BLEND_GRID
+
+    y_true = np.asarray(y_true, dtype=float)
+    pred_residual = np.asarray(pred_residual, dtype=float)
+    pred_direct = np.asarray(pred_direct, dtype=float)
+    pred_base = np.asarray(pred_base, dtype=float)
+
+    best_w = 1.0
+    best_pred = pred_base.copy()
+    best_rmse = rmse(y_true, pred_base)
+
+    for w in grid:
+        pred = safe_clip_nonneg(w * pred_residual + (1.0 - w) * pred_direct)
+        sc = rmse(y_true, pred)
+        if sc < best_rmse:
+            best_rmse = sc
+            best_w = float(w)
+            best_pred = pred.copy()
+
+    return float(best_w), best_pred, float(best_rmse)
+
+
+def tail_holdout_split(X, y, w=None, holdout_days: int = 45, min_train: int = 180, min_val: int = 45):
+    n = len(X)
+    n_val = int(max(min_val, holdout_days))
+    if n <= (min_train + n_val):
+        return X, y, w, None, None, None
+
+    X_tr = X.iloc[:-n_val].copy()
+    X_va = X.iloc[-n_val:].copy()
+    y_arr = np.asarray(y, dtype=float)
+    y_tr = y_arr[:-n_val]
+    y_va = y_arr[-n_val:]
+
+    if w is None:
+        w_tr = None
+        w_va = None
+    else:
+        w_arr = np.asarray(w, dtype=float)
+        w_tr = w_arr[:-n_val]
+        w_va = w_arr[-n_val:]
+
+    return X_tr, y_tr, w_tr, X_va, y_va, w_va
+
+
+def fit_cat_model_with_tail_early_stop(model, X_train, y_train, w_train=None, holdout_days: int = 45):
+    X_tr, y_tr, w_tr, X_va, y_va, w_va = tail_holdout_split(
+        X_train, y_train, w=w_train, holdout_days=holdout_days, min_train=180, min_val=45
+    )
+    if X_va is None:
+        return fit_cat_model(model, X_train, y_train, w_train=w_train)
+    return fit_cat_model(model, X_tr, y_tr, w_train=w_tr, X_val=X_va, y_val=y_va, w_val=w_va)
+
+# ============================================================
+# 4) LOAD DATA
+# ============================================================
+
+
+def load_raw_df() -> pd.DataFrame:
+    if not os.path.exists(EXCEL_PATH):
+        raise FileNotFoundError(f"Arquivo nao encontrado: {EXCEL_PATH}")
+
+    print("Lendo arquivo:", EXCEL_PATH)
+    _sheet = 0 if SHEET_NAME is None else SHEET_NAME
+    df_obj = pd.read_excel(EXCEL_PATH, sheet_name=_sheet)
+
+    if isinstance(df_obj, dict):
+        first_key = next(iter(df_obj.keys()))
+        df = df_obj[first_key].copy()
+        print("Atencao: read_excel retornou dict, usando a primeira aba:", first_key)
+    else:
+        df = df_obj.copy()
+
+    df.columns = [str(c).strip() for c in df.columns]
+    date_col = DATE_COL if (DATE_COL is not None) else guess_date_col(df)
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).copy()
+
+    df = map_and_rename_raw_columns(df, RAW_FEATURES)
+
+    if TARGET_COL not in df.columns:
+        raise ValueError(f"TARGET_COL='{TARGET_COL}' nao existe no Excel.")
+
+    df[TARGET_COL] = pd.to_numeric(df[TARGET_COL], errors="coerce")
+    for c in RAW_FEATURES:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.sort_values(date_col).set_index(date_col)
+    df.index = pd.DatetimeIndex(df.index).normalize()
+
+    full_idx = pd.date_range(df.index.min(), df.index.max(), freq="D")
+    df = df.reindex(full_idx)
+
+    bt_start = pd.Timestamp(BACKTEST_START) if BACKTEST_START else df.index.min()
+    bt_end = pd.Timestamp(BACKTEST_END) if BACKTEST_END else df.index.max()
+    df_bt = df.loc[bt_start:bt_end].copy()
+
+    print(f"Periodo backtest: {df_bt.index.min().date()} -> {df_bt.index.max().date()}")
+    print("Features RAW:", RAW_FEATURES)
+    return df_bt
+
+# ============================================================
+# 5) FEATURES
+# ============================================================
+
+EXOG_LIGHT_LAGS = (1, 2, 3, 7, 14, 21, 28)
+EXOG_RICH_WINDOWS = (3, 7, 14, 28)
+
+
+def build_context_features(index: pd.DatetimeIndex) -> pd.DataFrame:
+    dti = pd.DatetimeIndex(index)
+    doy = dti.dayofyear.astype(int)
+    dow = dti.dayofweek.astype(int)
+    month = dti.month.astype(int)
+    weekofyear = dti.isocalendar().week.astype(int)
+    quarter = dti.quarter.astype(int)
+    is_month_start = dti.is_month_start.astype(int)
+    is_month_end = dti.is_month_end.astype(int)
+    is_weekend = (dti.dayofweek >= 5).astype(int)
+    time_idx = np.arange(len(dti), dtype=float)
+
+    ang_doy = 2.0 * np.pi * (doy / 365.25)
+    ang_w = 2.0 * np.pi * (weekofyear / 52.1775)
+    ang_m = 2.0 * np.pi * (month / 12.0)
+
+    Xc = pd.DataFrame(index=dti)
+    Xc["doy"] = doy
+    Xc["dow"] = dow
+    Xc["month"] = month
+    Xc["weekofyear"] = weekofyear
+    Xc["quarter"] = quarter
+    Xc["sin_doy"] = np.sin(ang_doy)
+    Xc["cos_doy"] = np.cos(ang_doy)
+    Xc["sin_week"] = np.sin(ang_w)
+    Xc["cos_week"] = np.cos(ang_w)
+    Xc["sin_month"] = np.sin(ang_m)
+    Xc["cos_month"] = np.cos(ang_m)
+    Xc["is_month_start"] = is_month_start
+    Xc["is_month_end"] = is_month_end
+    Xc["is_weekend"] = is_weekend
+    Xc["time_idx"] = time_idx
+    return Xc
+
+
+def add_env_interactions(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+    base_cols = set(X.columns)
+
+    def _maybe(a, b, out):
+        if (a in base_cols) and (b in base_cols):
+            X[out] = X[a] * X[b]
+
+    _maybe("PM2_5", "UMIDRELAT", "PM2_5_x_UMIDRELAT")
+    _maybe("PM10", "UMIDRELAT", "PM10_x_UMIDRELAT")
+    _maybe("O3", "TEMPMED", "O3_x_TEMPMED")
+    _maybe("NO2", "TEMPMED", "NO2_x_TEMPMED")
+    _maybe("PM2_5", "VELVENTO", "PM2_5_x_VELVENTO")
+    _maybe("PM10", "PRECIPIT", "PM10_x_PRECIPIT")
+    _maybe("SO2", "UMIDRELAT", "SO2_x_UMIDRELAT")
+    return X
+
+
+def build_exog_features(df_raw: pd.DataFrame, exog_feature_set: str, exog_known_lag_days: int) -> pd.DataFrame:
+    Xraw = df_raw[RAW_FEATURES].copy()
+
+    lag0 = max(0, int(exog_known_lag_days))
+    if lag0 > 0:
+        Xraw = Xraw.shift(lag0)
+
+    X = add_env_interactions(Xraw)
+
+    for c in RAW_FEATURES:
+        s0 = Xraw[c]
+        s1 = s0.shift(1)
+
+        r3 = s1.rolling(3, min_periods=2)
+        r7 = s1.rolling(7, min_periods=3)
+        r14 = s1.rolling(14, min_periods=5)
+        r28 = s1.rolling(28, min_periods=7)
+
+        X[f"{c}_mean7_minus28"] = r7.mean() - r28.mean()
+        X[f"{c}_mean3_minus14"] = r3.mean() - r14.mean()
+        X[f"{c}_anom7"] = s0 - r7.mean()
+        X[f"{c}_anom14"] = s0 - r14.mean()
+        X[f"{c}_delta1"] = s1 - s1.shift(1)
+        X[f"{c}_delta7"] = s1 - s1.shift(7)
+
+        if exog_feature_set in ["raw_lags_light", "raw_lags_rich"]:
+            for L in EXOG_LIGHT_LAGS:
+                X[f"{c}_lag{int(L)}"] = s0.shift(int(L))
+
+        if exog_feature_set == "raw_lags_rich":
+            for w in EXOG_RICH_WINDOWS:
+                rr = s1.rolling(int(w), min_periods=max(2, int(w) // 3))
+                X[f"{c}_roll_mean{int(w)}"] = rr.mean()
+                X[f"{c}_roll_std{int(w)}"] = rr.std()
+                X[f"{c}_roll_median{int(w)}"] = rr.median()
+                X[f"{c}_roll_min{int(w)}"] = rr.min()
+                X[f"{c}_roll_max{int(w)}"] = rr.max()
+
+    return X
+
+
+def build_base_design_matrix(
+    y: pd.Series,
+    index: pd.DatetimeIndex,
+    lags: Tuple[int, ...],
+    roll_windows: Tuple[int, ...]
+) -> pd.DataFrame:
+    X = pd.DataFrame(index=index)
+
+    for L in lags:
+        X[f"y_lag{int(L)}"] = y.shift(int(L)).reindex(index).values
+
+    shifted = y.shift(1)
+    for w in roll_windows:
+        r = shifted.rolling(int(w), min_periods=max(2, int(w) // 2))
+        X[f"y_roll_mean{int(w)}"] = r.mean().reindex(index).values
+        X[f"y_roll_std{int(w)}"] = r.std().reindex(index).values
+        X[f"y_roll_median{int(w)}"] = r.median().reindex(index).values
+
+    for span in (7, 14, 28):
+        ewm = shifted.ewm(span=int(span), adjust=False, min_periods=max(2, int(span) // 3)).mean()
+        X[f"y_ewm_mean{int(span)}"] = ewm.reindex(index).values
+
+    if "y_lag364" in X.columns and "y_lag365" in X.columns:
+        X["y_seasonal_mean364_365"] = np.nanmean(
+            np.vstack([X["y_lag364"].values, X["y_lag365"].values]), axis=0
+        )
+    elif "y_lag364" in X.columns:
+        X["y_seasonal_mean364_365"] = X["y_lag364"]
+    elif "y_lag365" in X.columns:
+        X["y_seasonal_mean364_365"] = X["y_lag365"]
+
+    if "y_lag1" in X.columns and "y_lag7" in X.columns:
+        X["y_diff_lag1_lag7"] = X["y_lag1"] - X["y_lag7"]
+    if "y_lag7" in X.columns and "y_lag14" in X.columns:
+        X["y_diff_lag7_lag14"] = X["y_lag7"] - X["y_lag14"]
+    if "y_roll_mean7" in X.columns and "y_roll_mean28" in X.columns:
+        X["y_roll_mean7_minus28"] = X["y_roll_mean7"] - X["y_roll_mean28"]
+    if "y_lag7" in X.columns and "y_seasonal_mean364_365" in X.columns:
+        X["y_diff_week_vs_seasonal"] = X["y_lag7"] - X["y_seasonal_mean364_365"]
+
+    ctx = build_context_features(pd.DatetimeIndex(index))
+    X = pd.concat([X, ctx], axis=1)
+    X["pandemia"] = pandemic_flag(pd.DatetimeIndex(index))
+    return X
+
+
+def build_base_feature_row(y_hist: pd.Series, date: pd.Timestamp, lags: Tuple[int, ...], roll_windows: Tuple[int, ...]) -> pd.DataFrame:
+    date = pd.Timestamp(date).normalize()
+    return build_base_design_matrix(y_hist, pd.DatetimeIndex([date]), lags=lags, roll_windows=roll_windows)
+
+
+def prepare_df_for_config(df_bt_raw: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    exog_fill_mode = cfg["exog_fill_mode"]
+    exog_ffill_limit = cfg["exog_ffill_limit"]
+    add_missing_flags = cfg["add_missing_flags"]
+    exog_feature_set = cfg["exog_feature_set"]
+    exog_known_lag_days = cfg["exog_known_lag_days"]
+
+    df = df_bt_raw[[TARGET_COL] + RAW_FEATURES].copy()
+
+    if add_missing_flags:
+        for c in RAW_FEATURES:
+            df[f"{c}_isna"] = df[c].isna().astype(int)
+
+    exog = df[RAW_FEATURES].copy()
+    if exog_fill_mode == "none":
+        pass
+    elif exog_fill_mode == "ffill":
+        exog = exog.ffill(limit=int(exog_ffill_limit))
+    elif exog_fill_mode == "ffill_rolling":
+        exog = causal_fill_exog_frame(exog, ffill_limit=int(exog_ffill_limit), roll_window=21)
+    else:
+        raise ValueError("exog_fill_mode invalido.")
+
+    df_f = df.copy()
+    df_f[RAW_FEATURES] = exog
+
+    Xenv = build_exog_features(
+        df_f,
+        exog_feature_set=exog_feature_set,
+        exog_known_lag_days=int(exog_known_lag_days),
+    )
+
+    if add_missing_flags:
+        flags = df[[f"{c}_isna" for c in RAW_FEATURES]].copy()
+        Xenv = pd.concat([Xenv, flags], axis=1)
+
+    exog_features = list(Xenv.columns)
+    return df_f, Xenv, exog_features
+
+
+def make_base_model(cfg: Dict[str, Any]) -> Tuple[Pipeline, str]:
+    kind = str(cfg["base_model_kind"])
+    alpha = float(cfg["base_alpha"])
+
+    if kind == "elasticnet":
+        l1_ratio = float(cfg["elastic_l1_ratio"])
+        estimator = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, fit_intercept=True, max_iter=20000, random_state=RANDOM_SEED)
+        step_name = "elasticnet"
+    else:
+        estimator = Ridge(alpha=alpha, fit_intercept=True)
+        step_name = "ridge"
+
+    pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        (step_name, estimator),
+    ])
+    return pipe, step_name
+
+# ============================================================
+# 6) CATBOOST
+# ============================================================
+
+
+def make_cat_model(cfg: Dict[str, Any], mode: str, seed: int):
+    if not HAVE_CATBOOST:
+        raise RuntimeError("CatBoost nao esta disponivel. Instale catboost.")
+
+    if mode == "hpo":
+        iters = CAT_ITER_HPO
+        od_wait = CAT_EARLY_STOP_HPO
+    else:
+        iters = CAT_ITER_FINAL
+        od_wait = CAT_EARLY_STOP_FINAL
+
+    bootstrap_type = str(cfg["bootstrap_type"])
+
+    params = dict(
+        loss_function=str(cfg["cat_loss"]),
+        eval_metric="RMSE",
+        iterations=int(iters),
+        random_seed=int(seed),
+        verbose=False,
+        od_type="Iter",
+        od_wait=int(od_wait),
+        allow_writing_files=False,
+        thread_count=-1,
+        depth=int(cfg["depth"]),
+        learning_rate=float(cfg["learning_rate"]),
+        l2_leaf_reg=float(cfg["l2_leaf_reg"]),
+        rsm=float(cfg["rsm"]),
+        min_data_in_leaf=int(cfg["min_data_in_leaf"]),
+        random_strength=float(cfg["random_strength"]),
+        bootstrap_type=bootstrap_type,
+        boosting_type="Ordered",
+        has_time=True,
+        nan_mode="Min",
+        border_count=int(cfg["border_count"]),
+    )
+
+    if bootstrap_type == "Bayesian":
+        params["bagging_temperature"] = float(cfg["bagging_temperature"])
+    else:
+        params["subsample"] = float(cfg["subsample"])
+
+    return CatBoostRegressor(**params)
+
+
+def fit_cat_model(model, X_train, y_train, w_train=None, X_val=None, y_val=None, w_val=None):
+    train_pool = Pool(X_train, y_train, weight=w_train)
+    if (X_val is not None) and (y_val is not None) and len(X_val) > 0:
+        val_pool = Pool(X_val, y_val, weight=w_val)
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+    else:
+        model.fit(train_pool)
+    return model
+
+
+def predict_cat_model(model, X):
+    return np.asarray(model.predict(X), dtype=float)
+
+# ============================================================
+# 7) HPO OPCIONAL E LEVE
+# ============================================================
+
+
+def sample_config_optuna(trial: "optuna.Trial") -> Dict[str, Any]:
+    cfg = {
+        "exog_fill_mode": trial.suggest_categorical("exog_fill_mode", ["ffill_rolling", "ffill"]),
+        "exog_ffill_limit": int(trial.suggest_categorical("exog_ffill_limit", [3, 7, 14])),
+        "add_missing_flags": bool(trial.suggest_categorical("add_missing_flags", [True, False])),
+        "exog_feature_set": trial.suggest_categorical("exog_feature_set", ["raw", "raw_lags_light"]),
+        "exog_known_lag_days": int(trial.suggest_categorical("exog_known_lag_days", [0, 1])),
+        "base_model_kind": trial.suggest_categorical("base_model_kind", ["elasticnet", "ridge"]),
+        "base_alpha": float(trial.suggest_float("base_alpha", 1e-4, 0.05, log=True)),
+        "elastic_l1_ratio": float(trial.suggest_float("elastic_l1_ratio", 0.03, 0.25)),
+        "target_lags": trial.suggest_categorical(
+            "target_lags_name",
+            [
+                (1, 2, 3, 4, 5, 6, 7, 10, 14, 21, 28, 364, 365),
+                (1, 2, 3, 4, 5, 6, 7, 10, 14, 21, 28, 35, 42, 364, 365),
+                (1, 2, 3, 4, 5, 6, 7, 10, 14, 21, 28, 35, 42, 56, 84, 364, 365),
+            ]
+        ),
+        "roll_windows": trial.suggest_categorical("roll_windows_name", [(7, 14, 28), (7, 14, 28, 56)]),
+        "add_context": True,
+        "add_basepred": True,
+        "add_seasonal_baseline": True,
+        "use_recency_weights": bool(trial.suggest_categorical("use_recency_weights", [True, False])),
+        "recency_weight_power": float(trial.suggest_float("recency_weight_power", 1.0, 1.8)),
+        "depth": int(trial.suggest_int("depth", 4, 7)),
+        "learning_rate": float(trial.suggest_float("learning_rate", 0.015, 0.06, log=True)),
+        "l2_leaf_reg": float(trial.suggest_float("l2_leaf_reg", 0.8, 8.0, log=True)),
+        "subsample": float(trial.suggest_float("subsample", 0.75, 0.95)),
+        "rsm": float(trial.suggest_float("rsm", 0.75, 0.95)),
+        "min_data_in_leaf": int(trial.suggest_int("min_data_in_leaf", 25, 80)),
+        "random_strength": float(trial.suggest_float("random_strength", 0.0, 1.5)),
+        "bootstrap_type": str(trial.suggest_categorical("bootstrap_type", ["Bayesian"])),
+        "bagging_temperature": float(trial.suggest_float("bagging_temperature", 0.0, 2.0)),
+        "border_count": int(trial.suggest_categorical("border_count", [64, 128])),
+        "cat_loss_kind": str(trial.suggest_categorical("cat_loss_kind", ["RMSE", "AbsoluteError"])),
+    }
+    cfg["cat_loss"] = "MAE" if cfg["cat_loss_kind"] == "AbsoluteError" else "RMSE"
+    return cfg
+
+
+
+def cfg_from_frozen_trial(bt) -> Dict[str, Any]:
+    p = bt.params
+    cfg = {
+        "exog_fill_mode": p["exog_fill_mode"],
+        "exog_ffill_limit": int(p["exog_ffill_limit"]),
+        "add_missing_flags": bool(p["add_missing_flags"]),
+        "exog_feature_set": p["exog_feature_set"],
+        "exog_known_lag_days": int(p["exog_known_lag_days"]),
+        "base_model_kind": p["base_model_kind"],
+        "base_alpha": float(p["base_alpha"]),
+        "elastic_l1_ratio": float(p["elastic_l1_ratio"]),
+        "target_lags": tuple(p["target_lags_name"]),
+        "roll_windows": tuple(p["roll_windows_name"]),
+        "add_context": True,
+        "add_basepred": True,
+        "add_seasonal_baseline": True,
+        "use_recency_weights": bool(p["use_recency_weights"]),
+        "recency_weight_power": float(p["recency_weight_power"]),
+        "depth": int(p["depth"]),
+        "learning_rate": float(p["learning_rate"]),
+        "l2_leaf_reg": float(p["l2_leaf_reg"]),
+        "subsample": float(p["subsample"]),
+        "rsm": float(p["rsm"]),
+        "min_data_in_leaf": int(p["min_data_in_leaf"]),
+        "random_strength": float(p["random_strength"]),
+        "bootstrap_type": str(p["bootstrap_type"]),
+        "bagging_temperature": float(p["bagging_temperature"]),
+        "border_count": int(p["border_count"]),
+        "cat_loss_kind": str(p["cat_loss_kind"]),
+    }
+    cfg["cat_loss"] = "MAE" if cfg["cat_loss_kind"] == "AbsoluteError" else "RMSE"
+    return cfg
+
+
+def run_optuna_hpo(df_bt_raw: pd.DataFrame, folds: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not HAVE_OPTUNA:
+        print("Optuna nao esta disponivel, usando configuracao curada.")
+        return {"best_cfg": CURATED_CFG, "best_score": np.nan, "best_r2": np.nan}
+
+    hpo_folds = select_representative_hpo_folds(folds, n_select=HPO_FAST_FOLDS)
+    print("\nFolds usados no HPO rapido:")
+    for f in hpo_folds:
+        print(f"{f['fold']:02d}) train<= {f['train_end'].date()} | test {f['test_start'].date()} -> {f['test_end'].date()}")
+
+    storage = f"sqlite:///{OPTUNA_DB_PATH}"
+    sampler = optuna.samplers.TPESampler(seed=RANDOM_SEED, multivariate=True)
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=2)
+
+    study = optuna.create_study(
+        study_name=OPTUNA_STUDY_NAME,
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
+        storage=storage,
+        load_if_exists=True,
+    )
+
+    def objective(trial: "optuna.Trial") -> float:
+        cfg = sample_config_optuna(trial)
+        out = run_walkforward_once(
+            df_bt_raw=df_bt_raw,
+            cfg=cfg,
+            folds=hpo_folds,
+            trial=trial,
+            out_dir=None,
+            make_figs=False,
+            mode="hpo",
+        )
+        trial.set_user_attr("mean_r2", float(out["mean_r2"]))
+        return float(out["mean_score"])
+
+    study.optimize(
+        objective,
+        n_trials=int(MAX_TRIALS),
+        timeout=int(TIME_BUDGET_HOURS * 3600),
+        n_jobs=int(OPTUNA_N_JOBS),
+        gc_after_trial=True,
+        show_progress_bar=True,
+        catch=(Exception,),
+    )
+
+    bt = study.best_trial
+    return {
+        "best_cfg": cfg_from_frozen_trial(bt),
+        "best_score": float(bt.value),
+        "best_r2": float(bt.user_attrs.get("mean_r2", np.nan)),
+    }
+
+# ============================================================
+# 8) EXPLAINABILITY SOMENTE VARIAVEIS AMBIENTAIS E METEOROLOGICAS
+# ============================================================
+
+
+def build_env_only_explainability_artifacts(
+    cfg: Dict[str, Any],
+    df_bt: pd.DataFrame,
+    y_all: pd.Series,
+) -> Optional[Dict[str, Any]]:
+    df_exp = df_bt.loc[df_bt[TARGET_COL].notna()].copy()
+    if df_exp.empty:
+        return None
+
+    y_exp = df_exp[TARGET_COL].astype(float)
+    Xb_exp = build_base_design_matrix(
+        y_all,
+        df_exp.index,
+        lags=tuple(cfg["target_lags"]),
+        roll_windows=tuple(cfg["roll_windows"]),
+    )
+
+    if cfg["use_recency_weights"]:
+        w_exp = make_time_weights(df_exp.index, min_w=0.85, max_w=1.20, power=float(cfg["recency_weight_power"]))
+    else:
+        w_exp = np.ones(len(df_exp), dtype=float)
+
+    base_model_exp, base_step_exp = make_base_model(cfg)
+    base_model_exp.fit(Xb_exp, y_exp.values, **{f"{base_step_exp}__sample_weight": w_exp})
+    base_pred_exp = safe_clip_nonneg(base_model_exp.predict(Xb_exp))
+    res_exp = y_exp.values - base_pred_exp
+
+    X_env_raw = df_bt.loc[df_exp.index, RAW_FEATURES].copy()
+    X_env_raw = X_env_raw.apply(pd.to_numeric, errors="coerce")
+
+    explain_model = make_cat_model(cfg, mode="final", seed=FINAL_ENSEMBLE_SEEDS[0])
+    explain_pool = Pool(X_env_raw, res_exp, weight=w_exp)
+    explain_model.fit(explain_pool, verbose=False)
+
+    pvc = explain_model.get_feature_importance(type="PredictionValuesChange")
+    fi_env = pd.DataFrame({
+        "Variavel": RAW_FEATURES,
+        "Importancia": np.asarray(pvc, dtype=float),
+    }).sort_values("Importancia", ascending=False)
+
+    shap_vals = explain_model.get_feature_importance(explain_pool, type="ShapValues")
+    shap_vals = np.asarray(shap_vals, dtype=float)
+    if shap_vals.ndim != 2 or shap_vals.shape[1] != (len(RAW_FEATURES) + 1):
+        return {
+            "fi_env": fi_env,
+            "X_env": X_env_raw,
+            "shap_env": None,
+            "shap_mean_abs_env": None,
+        }
+
+    shap_df = pd.DataFrame(shap_vals[:, :-1], index=X_env_raw.index, columns=RAW_FEATURES)
+    shap_mean_abs_env = shap_df.abs().mean().sort_values(ascending=False)
+
+    return {
+        "fi_env": fi_env,
+        "X_env": X_env_raw,
+        "shap_env": shap_df,
+        "shap_mean_abs_env": shap_mean_abs_env,
+    }
+
+# ============================================================
+# 8B) FIGURAS SUPLEMENTARES (NOVO BLOCO)
+# ============================================================
+# Este bloco gera as figuras adicionais recomendadas para a tese.
+# Nada do pipeline principal eh alterado. As figuras sao salvas
+# na MESMA pasta FIGURES_SUBDIR do run em Downloads.
+# ============================================================
+
+
+def _save_supp(fig, fig_dir: str, name: str, saved_list):
+    paths = save_fig(fig, fig_dir, name)
+    saved_list.append(paths)
+
+
+def build_supplementary_figures(
+    df_bt: pd.DataFrame,
+    pred_all: pd.DataFrame,
+    results_df: pd.DataFrame,
+    cfg: Dict[str, Any],
+    y_all: pd.Series,
+    fig_dir: str,
+) -> List[Tuple[str, Optional[str]]]:
+    """
+    Gera as figuras suplementares 34 a 47, todas dentro de fig_dir.
+    """
+    set_pub_style()
+    ensure_dir(fig_dir)
+    saved = []
+
+    # ----------------------------------------------------------
+    # Caracterizacao exploratoria
+    # ----------------------------------------------------------
+
+    # fig34, HOSPCIDX bruta no periodo total
+    fig = plt.figure(figsize=(11, 4.6)); ax = fig.add_subplot(111)
+    serie_full = df_bt[TARGET_COL].dropna()
+    ax.plot(serie_full.index, serie_full.values, linewidth=0.9, alpha=0.85)
+    media = float(serie_full.mean())
+    ax.axhline(media, linestyle="--", linewidth=1.0, color="gray", label=f"Media = {media:.1f}")
+    ax.set_title("Caracterizacao exploratoria, serie diaria observada de HOSPCIDX")
+    ax.set_xlabel("Data"); ax.set_ylabel(TARGET_COL); ax.legend()
+    _save_supp(fig, fig_dir, "fig34_caracterizacao_HOSPCIDX_serie_diaria", saved)
+
+    # fig35, painel das 12 variaveis ambientais
+    fig, axes = plt.subplots(4, 3, figsize=(13.5, 11.5), sharex=False)
+    axes_flat = axes.ravel()
+    for i, var in enumerate(RAW_FEATURES):
+        ax = axes_flat[i]
+        s = df_bt[var].dropna()
+        ax.plot(s.index, s.values, linewidth=0.7, alpha=0.85)
+        ax.set_title(var, fontsize=10)
+        ax.tick_params(axis="x", labelsize=8)
+        ax.tick_params(axis="y", labelsize=8)
+        ax.grid(True, alpha=0.25)
+    fig.suptitle("Caracterizacao exploratoria, series diarias das 12 variaveis ambientais e meteorologicas", fontsize=12, y=1.0)
+    fig.tight_layout()
+    _save_supp(fig, fig_dir, "fig35_caracterizacao_12_variaveis_ambientais", saved)
+
+    # fig36, matriz de correlacao
+    cols_corr = RAW_FEATURES + [TARGET_COL]
+    df_corr = df_bt[cols_corr].apply(pd.to_numeric, errors="coerce")
+    corr_mat = df_corr.corr(method="spearman")
+    fig = plt.figure(figsize=(9.4, 8.0)); ax = fig.add_subplot(111)
+    im = ax.imshow(corr_mat.values, cmap="coolwarm", vmin=-1, vmax=1)
+    ax.set_xticks(np.arange(len(cols_corr))); ax.set_yticks(np.arange(len(cols_corr)))
+    ax.set_xticklabels(cols_corr, rotation=45, ha="right", fontsize=9)
+    ax.set_yticklabels(cols_corr, fontsize=9)
+    for i in range(len(cols_corr)):
+        for j in range(len(cols_corr)):
+            v = corr_mat.values[i, j]
+            color = "white" if abs(v) > 0.5 else "black"
+            ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=7, color=color)
+    cb = fig.colorbar(im, ax=ax, shrink=0.85); cb.set_label("Correlacao de Spearman")
+    ax.set_title("Matriz de correlacao de Spearman, variaveis preditoras e HOSPCIDX")
+    _save_supp(fig, fig_dir, "fig36_matriz_correlacao_preditoras_HOSPCIDX", saved)
+
+    # ----------------------------------------------------------
+    # Zooms em periodos pandemicos criticos
+    # ----------------------------------------------------------
+
+    pred_zoom = pred_all.copy()
+    pred_zoom.index = pd.to_datetime(pred_zoom.index)
+
+    zoom_windows = [
+        ("1T 2020, inicio da pandemia", "2020-01-01", "2020-03-31", "fig37_zoom_pandemia_1T2020"),
+        ("Pico de internacoes, mai-jun 2020", "2020-05-01", "2020-06-30", "fig38_zoom_pandemia_pico_mai_jun_2020"),
+        ("Recuperacao em 2022", "2022-01-01", "2022-12-31", "fig39_zoom_recuperacao_2022"),
+    ]
+    for titulo, d0, d1, nome in zoom_windows:
+        sub = pred_zoom.loc[(pred_zoom.index >= d0) & (pred_zoom.index <= d1)]
+        if sub.empty:
+            continue
+        fig = plt.figure(figsize=(11, 4.6)); ax = fig.add_subplot(111)
+        ax.plot(sub.index, sub["y_true"], linewidth=1.4, label=f"{TARGET_COL} observado")
+        ax.plot(sub.index, sub["y_pred"], linewidth=1.4, label=f"{TARGET_COL} predito")
+        ax.set_title(f"Zoom temporal, {titulo}")
+        ax.set_xlabel("Data"); ax.set_ylabel(TARGET_COL); ax.legend()
+        _save_supp(fig, fig_dir, nome, saved)
+
+    # fig40, modelo vs baselines em zoom da pandemia
+    sub_b = pred_zoom.loc[(pred_zoom.index >= "2020-03-01") & (pred_zoom.index <= "2020-08-31")]
+    if not sub_b.empty:
+        fig = plt.figure(figsize=(11.5, 5.0)); ax = fig.add_subplot(111)
+        ax.plot(sub_b.index, sub_b["y_true"], linewidth=1.6, label=f"{TARGET_COL} observado", color="black")
+        ax.plot(sub_b.index, sub_b["y_pred"], linewidth=1.4, label="Modelo hibrido")
+        ax.plot(sub_b.index, sub_b["baseline_weekly"], linewidth=1.0, linestyle="--", label="Baseline semanal")
+        ax.plot(sub_b.index, sub_b["baseline_improved"], linewidth=1.0, linestyle=":", label="Baseline improved")
+        ax.plot(sub_b.index, sub_b["baseline_seasonal"], linewidth=1.0, linestyle="-.", label="Baseline sazonal")
+        ax.set_title("Modelo hibrido vs baselines, mar-ago 2020")
+        ax.set_xlabel("Data"); ax.set_ylabel(TARGET_COL); ax.legend()
+        _save_supp(fig, fig_dir, "fig40_modelo_vs_baselines_zoom_pandemia", saved)
+
+    # ----------------------------------------------------------
+    # Q-Q plot dos residuos
+    # ----------------------------------------------------------
+
+    pred_qq = pred_all.dropna(subset=["y_true", "y_pred"]).copy()
+    if not pred_qq.empty:
+        res = (pred_qq["y_true"] - pred_qq["y_pred"]).values
+        fig = plt.figure(figsize=(6.6, 6.0)); ax = fig.add_subplot(111)
+        scipy_stats.probplot(res, dist="norm", plot=ax)
+        ax.set_title("Q-Q plot dos residuos vs distribuicao normal")
+        ax.set_xlabel("Quantis teoricos da normal")
+        ax.set_ylabel("Quantis empiricos dos residuos")
+        _save_supp(fig, fig_dir, "fig41_qq_plot_residuos", saved)
+
+    # ----------------------------------------------------------
+    # SHAP dependence plots adicionais, CO e NO2
+    # ----------------------------------------------------------
+
+    try:
+        artifacts = build_env_only_explainability_artifacts(cfg=cfg, df_bt=df_bt, y_all=y_all)
+        if artifacts is not None and artifacts.get("shap_env") is not None:
+            shap_df = artifacts["shap_env"]
+            X_env = artifacts["X_env"]
+
+            extra_targets = [("CO", "fig42_shap_dependence_CO"), ("NO2", "fig43_shap_dependence_NO2")]
+            for feat, fname in extra_targets:
+                if feat in shap_df.columns and feat in X_env.columns:
+                    xv = pd.to_numeric(X_env[feat], errors="coerce")
+                    sv = pd.to_numeric(shap_df[feat], errors="coerce")
+                    mask = xv.notna() & sv.notna()
+                    if int(mask.sum()) >= 20:
+                        xv = xv.loc[mask]; sv = sv.loc[mask]
+                        order = np.argsort(xv.values)
+                        xv_sorted = xv.values[order]; sv_sorted = sv.values[order]
+                        roll_n = max(15, int(len(xv_sorted) * 0.05))
+                        smooth = pd.Series(sv_sorted).rolling(roll_n, min_periods=max(5, roll_n // 3)).mean()
+                        fig = plt.figure(figsize=(7.6, 5.2)); ax = fig.add_subplot(111)
+                        ax.scatter(xv, sv, s=14, alpha=0.45)
+                        ax.plot(xv_sorted, smooth.values, linewidth=2.0)
+                        ax.axhline(0.0, linestyle="--", linewidth=1.0)
+                        ax.set_title(f"Dependence plot SHAP, {feat}, somente variavel ambiental ou meteorologica")
+                        ax.set_xlabel(feat)
+                        ax.set_ylabel(f"SHAP de {feat}")
+                        _save_supp(fig, fig_dir, fname, saved)
+    except Exception as e:
+        print("Aviso: dependence plots adicionais falharam, seguindo:", e)
+
+    # ----------------------------------------------------------
+    # Boxplots mensais de variaveis-chave
+    # ----------------------------------------------------------
+
+    def _box_mensal(var: str, titulo: str, ylabel: str, nome: str):
+        if var not in df_bt.columns:
+            return
+        serie = df_bt[var].dropna()
+        if serie.empty:
+            return
+        meses = pd.DatetimeIndex(serie.index).month
+        data_mes = [serie.values[meses == m] for m in range(1, 13)]
+        fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+        ax.boxplot(data_mes, labels=_month_labels_pt(), showfliers=False)
+        ax.set_title(titulo)
+        ax.set_xlabel("Mes"); ax.set_ylabel(ylabel)
+        _save_supp(fig, fig_dir, nome, saved)
+
+    _box_mensal("PM2_5", "Distribuicao mensal de PM2,5", "PM2,5 (ug/m3)", "fig44_boxplot_mensal_PM2_5")
+    _box_mensal("TEMPMED", "Distribuicao mensal de TEMPMED", "Temperatura media (C)", "fig45_boxplot_mensal_TEMPMED")
+    _box_mensal("CO", "Distribuicao mensal de CO", "CO (ppm)", "fig46_boxplot_mensal_CO")
+
+    # ----------------------------------------------------------
+    # Diagrama PRISMA da revisao sistematica
+    # ----------------------------------------------------------
+
+    fig = plt.figure(figsize=(10.8, 11.5))
+    ax = fig.add_subplot(111)
+    ax.set_xlim(0, 10); ax.set_ylim(0, 14)
+    ax.axis("off")
+
+    def _caixa(x, y, w, h, texto, cor="#E7EEF7"):
+        box = FancyBboxPatch((x, y), w, h,
+                             boxstyle="round,pad=0.08,rounding_size=0.1",
+                             linewidth=1.0, edgecolor="#333333", facecolor=cor)
+        ax.add_patch(box)
+        ax.text(x + w / 2.0, y + h / 2.0, texto, ha="center", va="center",
+                fontsize=9.0, color="#111111", wrap=True)
+
+    def _seta(x0, y0, x1, y1):
+        arrow = FancyArrowPatch((x0, y0), (x1, y1),
+                                arrowstyle="-|>",
+                                mutation_scale=14,
+                                linewidth=1.1,
+                                color="#333333")
+        ax.add_patch(arrow)
+
+    ax.text(0.2, 13.6, "Identificacao", fontsize=12, fontweight="bold")
+    _caixa(0.5, 11.6, 4.2, 1.6,
+           "Registros identificados nas bases\nPubMed, Scopus, Web of Science,\nScienceDirect, SpringerLink,\nIEEE Xplore, MDPI e Google Scholar")
+    _caixa(5.3, 11.6, 4.2, 1.6,
+           "Registros identificados\nem outras fontes\n(referencias cruzadas\ne literatura citada)")
+
+    ax.text(0.2, 11.0, "Triagem", fontsize=12, fontweight="bold")
+    _caixa(2.9, 9.0, 4.2, 1.6,
+           "Registros apos remocao\nde duplicatas")
+    _seta(2.6, 11.6, 4.5, 10.6)
+    _seta(7.4, 11.6, 5.5, 10.6)
+    _caixa(0.4, 6.8, 4.0, 1.6,
+           "Registros triados\npor titulo e resumo")
+    _caixa(5.6, 6.8, 4.0, 1.6,
+           "Registros excluidos\n(fora do escopo, sem desfecho\nhospitalar respiratorio,\nsem ML ou IA aplicada)")
+    _seta(5.0, 9.0, 2.4, 8.4)
+    _seta(5.0, 9.0, 7.6, 8.4)
+
+    ax.text(0.2, 6.2, "Elegibilidade", fontsize=12, fontweight="bold")
+    _caixa(0.4, 4.2, 4.0, 1.6,
+           "Artigos avaliados\nem texto completo")
+    _caixa(5.6, 4.2, 4.0, 1.6,
+           "Artigos excluidos apos\nleitura completa, com\njustificativa registrada")
+    _seta(2.4, 6.8, 2.4, 5.8)
+    _seta(4.4, 5.0, 5.6, 5.0)
+
+    ax.text(0.2, 3.6, "Inclusao", fontsize=12, fontweight="bold")
+    _caixa(2.9, 1.4, 4.2, 1.8,
+           "Estudos incluidos\nna sintese qualitativa\n(11 estudos primarios e\nrevisoes sistematicas)")
+    _seta(2.4, 4.2, 4.5, 3.2)
+
+    ax.set_title("Diagrama de fluxo PRISMA 2020 da revisao sistematica", fontsize=12)
+    _save_supp(fig, fig_dir, "fig47_diagrama_PRISMA_revisao_sistematica", saved)
+
+    # Manifesto das figuras suplementares
+    with open(os.path.join(fig_dir, "figures_supplementary_generated.txt"), "w", encoding="utf-8") as f:
+        f.write("Figuras suplementares geradas:\n")
+        for png_path, pdf_path in saved:
+            f.write(f"PNG: {png_path}\n")
+            if pdf_path is not None:
+                f.write(f"PDF: {pdf_path}\n")
+            f.write("\n")
+
+    print("\n===== FIGURAS SUPLEMENTARES SALVAS =====")
+    print("Pasta:", os.path.abspath(fig_dir))
+    print("Total de figuras suplementares:", len(saved))
+
+    return saved
+
+# ============================================================
+# 9) WALK-FORWARD
+# ============================================================
+
+
+def run_walkforward_once(
+    df_bt_raw: pd.DataFrame,
+    cfg: Dict[str, Any],
+    folds: List[Dict[str, Any]],
+    trial: Optional["optuna.Trial"] = None,
+    out_dir: Optional[str] = None,
+    make_figs: bool = False,
+    mode: str = "final",
+) -> Dict[str, Any]:
+
+    if not HAVE_CATBOOST:
+        raise RuntimeError("CatBoost nao foi carregado.")
+
+    df_bt, Xenv_all, exog_features = prepare_df_for_config(df_bt_raw, cfg)
+    y_all = df_bt[TARGET_COL].copy()
+    pand_all = pd.Series(pandemic_flag(df_bt.index), index=df_bt.index, name="pandemia")
+
+    add_context = cfg["add_context"]
+    add_basepred = cfg["add_basepred"]
+    add_seasonal_baseline = cfg.get("add_seasonal_baseline", True)
+    lags = tuple(cfg["target_lags"])
+    roll_windows = tuple(cfg["roll_windows"])
+
+    Xctx_all = build_context_features(df_bt.index) if add_context else pd.DataFrame(index=df_bt.index)
+    Xbase_all = build_base_design_matrix(y_all, df_bt.index, lags=lags, roll_windows=roll_windows)
+
+    rows = []
+    preds_concat = []
+    rmse_running = []
+    print_prefix = "[HPO]" if mode == "hpo" else "[FINAL]"
+
+    for fold_counter, f in enumerate(folds, start=1):
+        fold_id = f["fold"]
+        train_end = f["train_end"]
+        test_start = f["test_start"]
+        test_end = f["test_end"]
+
+        train_mask = (df_bt.index <= train_end)
+        test_mask = (df_bt.index >= test_start) & (df_bt.index <= test_end)
+
+        df_train_full = df_bt.loc[train_mask].copy()
+        df_test = df_bt.loc[test_mask].copy()
+        df_test = df_test.loc[df_test[TARGET_COL].notna()].copy()
+
+        if df_test.empty or df_train_full.empty:
+            continue
+
+        val_start = df_train_full.index.max() - pd.Timedelta(days=INNER_VAL_DAYS - 1)
+        df_val = df_train_full.loc[df_train_full.index >= val_start].copy()
+        df_train = df_train_full.loc[df_train_full.index < val_start].copy()
+
+        df_train = df_train.loc[df_train[TARGET_COL].notna()].copy()
+        df_val = df_val.loc[df_val[TARGET_COL].notna()].copy()
+
+        if len(df_train) < 240 or len(df_val) < 45:
+            continue
+
+        y_train = df_train[TARGET_COL].astype(float)
+        y_val = df_val[TARGET_COL].astype(float)
+        y_test = df_test[TARGET_COL].astype(float)
+
+        if cfg["use_recency_weights"]:
+            w_train = make_time_weights(df_train.index, min_w=0.85, max_w=1.20, power=float(cfg["recency_weight_power"]))
+            w_val = np.ones(len(df_val), dtype=float)
+        else:
+            w_train = np.ones(len(df_train), dtype=float)
+            w_val = np.ones(len(df_val), dtype=float)
+
+        base_model, base_step_name = make_base_model(cfg)
+        Xb_train = Xbase_all.loc[df_train.index].copy()
+        Xb_val = Xbase_all.loc[df_val.index].copy()
+        base_model.fit(Xb_train, y_train.values, **{f"{base_step_name}__sample_weight": w_train})
+        base_pred_train = safe_clip_nonneg(base_model.predict(Xb_train))
+        base_pred_val = safe_clip_nonneg(base_model.predict(Xb_val))
+
+        res_train = y_train.values - base_pred_train
+        res_val = y_val.values - base_pred_val
+
+        seasonal_train = pd.Series([seasonal_baseline_from_hist(y_all, d) for d in df_train.index], index=df_train.index, name="seasonal_baseline")
+        seasonal_val = pd.Series([seasonal_baseline_from_hist(y_all, d) for d in df_val.index], index=df_val.index, name="seasonal_baseline")
+
+        Xr_train_parts = [Xenv_all.loc[df_train.index, exog_features]]
+        Xr_val_parts = [Xenv_all.loc[df_val.index, exog_features]]
+
+        if add_context and not Xctx_all.empty:
+            Xr_train_parts.append(Xctx_all.loc[df_train.index])
+            Xr_val_parts.append(Xctx_all.loc[df_val.index])
+
+        Xr_train_parts.append(pand_all.loc[df_train.index])
+        Xr_val_parts.append(pand_all.loc[df_val.index])
+
+        if add_basepred:
+            Xr_train_parts.append(pd.Series(base_pred_train, index=df_train.index, name="base_pred"))
+            Xr_val_parts.append(pd.Series(base_pred_val, index=df_val.index, name="base_pred"))
+
+        if add_seasonal_baseline:
+            Xr_train_parts.append(seasonal_train)
+            Xr_val_parts.append(seasonal_val)
+
+        Xr_train = pd.concat(Xr_train_parts, axis=1)
+        Xr_val = pd.concat(Xr_val_parts, axis=1)
+
+        seeds = [RANDOM_SEED] if mode == "hpo" else (FINAL_ENSEMBLE_SEEDS if USE_FINAL_ENSEMBLE else [RANDOM_SEED])
+        train_mode = "hpo" if mode == "hpo" else "final"
+
+        val_preds_residual_stack = []
+        for seed in seeds:
+            model_r = make_cat_model(cfg, mode=train_mode, seed=seed)
+            fit_cat_model(model_r, Xr_train, res_train, w_train=w_train, X_val=Xr_val, y_val=res_val, w_val=w_val)
+            val_preds_residual_stack.append(predict_cat_model(model_r, Xr_val))
+
+        pred_res_val = np.mean(np.vstack(val_preds_residual_stack), axis=0)
+        yhat_val_residual = safe_clip_nonneg(base_pred_val + pred_res_val)
+
+        Xd_train_parts = [Xbase_all.loc[df_train.index].copy(), Xenv_all.loc[df_train.index, exog_features].copy()]
+        Xd_val_parts = [Xbase_all.loc[df_val.index].copy(), Xenv_all.loc[df_val.index, exog_features].copy()]
+        if add_seasonal_baseline:
+            Xd_train_parts.append(seasonal_train)
+            Xd_val_parts.append(seasonal_val)
+        Xd_train = pd.concat(Xd_train_parts, axis=1)
+        Xd_val = pd.concat(Xd_val_parts, axis=1)
+
+        val_preds_direct_stack = []
+        for seed in seeds:
+            model_d = make_cat_model(cfg, mode=train_mode, seed=seed + 1000)
+            fit_cat_model(model_d, Xd_train, y_train.values, w_train=w_train, X_val=Xd_val, y_val=y_val.values, w_val=w_val)
+            val_preds_direct_stack.append(predict_cat_model(model_d, Xd_val))
+        yhat_val_direct = safe_clip_nonneg(np.mean(np.vstack(val_preds_direct_stack), axis=0))
+
+        blend_w_residual, yhat_val_blend, _ = choose_best_blend_weight(
+            y_true=y_val.values,
+            pred_residual=yhat_val_residual,
+            pred_direct=yhat_val_direct,
+            pred_base=base_pred_val,
+            grid=DIRECT_BLEND_GRID,
+        )
+
+        chosen_strategy, chosen_val_rmse, strategy_scores = choose_best_strategy_on_validation(
+            y_true=y_val.values,
+            pred_base=base_pred_val,
+            pred_residual=yhat_val_residual,
+            pred_direct=yhat_val_direct,
+            pred_blend=yhat_val_blend,
+        )
+
+        df_train_full_nonan = df_train_full.loc[df_train_full[TARGET_COL].notna()].copy()
+        y_train_full = df_train_full_nonan[TARGET_COL].astype(float)
+        Xb_train_full = Xbase_all.loc[df_train_full_nonan.index].copy()
+
+        if cfg["use_recency_weights"]:
+            w_train_full = make_time_weights(df_train_full_nonan.index, min_w=0.85, max_w=1.20, power=float(cfg["recency_weight_power"]))
+        else:
+            w_train_full = np.ones(len(df_train_full_nonan), dtype=float)
+
+        base_refit, base_step_name_refit = make_base_model(cfg)
+        base_refit.fit(Xb_train_full, y_train_full.values, **{f"{base_step_name_refit}__sample_weight": w_train_full})
+        base_pred_train_full = safe_clip_nonneg(base_refit.predict(Xb_train_full))
+        res_train_full = y_train_full.values - base_pred_train_full
+
+        seasonal_full = pd.Series([seasonal_baseline_from_hist(y_all, d) for d in df_train_full_nonan.index], index=df_train_full_nonan.index, name="seasonal_baseline")
+
+        Xr_full_parts = [Xenv_all.loc[df_train_full_nonan.index, exog_features]]
+        if add_context and not Xctx_all.empty:
+            Xr_full_parts.append(Xctx_all.loc[df_train_full_nonan.index])
+        Xr_full_parts.append(pand_all.loc[df_train_full_nonan.index])
+        if add_basepred:
+            Xr_full_parts.append(pd.Series(base_pred_train_full, index=df_train_full_nonan.index, name="base_pred"))
+        if add_seasonal_baseline:
+            Xr_full_parts.append(seasonal_full)
+        Xr_train_full = pd.concat(Xr_full_parts, axis=1)
+        feature_order_r = list(Xr_train_full.columns)
+
+        models_final_r = []
+        for seed in seeds:
+            model_r_refit = make_cat_model(cfg, mode=train_mode, seed=seed)
+            fit_cat_model_with_tail_early_stop(model_r_refit, Xr_train_full, res_train_full, w_train=w_train_full, holdout_days=FINAL_REFIT_VAL_DAYS)
+            models_final_r.append(model_r_refit)
+
+        Xd_train_full_parts = [Xbase_all.loc[df_train_full_nonan.index].copy(), Xenv_all.loc[df_train_full_nonan.index, exog_features].copy()]
+        if add_seasonal_baseline:
+            Xd_train_full_parts.append(seasonal_full)
+        Xd_train_full = pd.concat(Xd_train_full_parts, axis=1)
+        feature_order_d = list(Xd_train_full.columns)
+
+        models_final_d = []
+        for seed in seeds:
+            model_d_refit = make_cat_model(cfg, mode=train_mode, seed=seed + 1000)
+            fit_cat_model_with_tail_early_stop(model_d_refit, Xd_train_full, y_train_full.values, w_train=w_train_full, holdout_days=FINAL_REFIT_VAL_DAYS)
+            models_final_d.append(model_d_refit)
+
+        y_hist = y_all.copy()
+        y_hist.loc[y_hist.index > train_end] = np.nan
+
+        preds = []
+        preds_base_only = []
+        preds_weekly = []
+        preds_seasonal = []
+        preds_residual_only = []
+        preds_direct_only = []
+        strategy_used = []
+
+        for d in df_test.index:
+            Xb_row = build_base_feature_row(y_hist, d, lags=lags, roll_windows=roll_windows)
+            base_pred_d = float(np.clip(base_refit.predict(Xb_row)[0], 0.0, None))
+            seasonal_d = seasonal_baseline_from_hist(y_hist, d)
+            if pd.isna(seasonal_d):
+                seasonal_d = base_pred_d
+
+            Xr_row_parts = [Xenv_all.loc[[d], exog_features]]
+            if add_context and not Xctx_all.empty:
+                Xr_row_parts.append(Xctx_all.loc[[d]])
+            Xr_row_parts.append(pand_all.loc[[d]])
+            if add_basepred:
+                Xr_row_parts.append(pd.Series([base_pred_d], index=[d], name="base_pred"))
+            if add_seasonal_baseline:
+                Xr_row_parts.append(pd.Series([seasonal_d], index=[d], name="seasonal_baseline"))
+            Xr_row = pd.concat(Xr_row_parts, axis=1)
+            for c in feature_order_r:
+                if c not in Xr_row.columns:
+                    Xr_row[c] = np.nan
+            Xr_row = Xr_row[feature_order_r]
+            res_pred_d = float(np.mean([predict_cat_model(m, Xr_row)[0] for m in models_final_r]))
+            yhat_residual_d = float(np.clip(base_pred_d + res_pred_d, 0.0, None))
+
+            Xd_row_parts = [Xb_row, Xenv_all.loc[[d], exog_features]]
+            if add_seasonal_baseline:
+                Xd_row_parts.append(pd.Series([seasonal_d], index=[d], name="seasonal_baseline"))
+            Xd_row = pd.concat(Xd_row_parts, axis=1)
+            for c in feature_order_d:
+                if c not in Xd_row.columns:
+                    Xd_row[c] = np.nan
+            Xd_row = Xd_row[feature_order_d]
+            yhat_direct_d = float(np.clip(np.mean([predict_cat_model(m, Xd_row)[0] for m in models_final_d]), 0.0, None))
+
+            yhat_blend_d = float(np.clip(blend_w_residual * yhat_residual_d + (1.0 - blend_w_residual) * yhat_direct_d, 0.0, None))
+
+            if chosen_strategy == "base_only":
+                yhat_d = base_pred_d
+            elif chosen_strategy == "residual_only":
+                yhat_d = yhat_residual_d
+            elif chosen_strategy == "direct_only":
+                yhat_d = yhat_direct_d
+            else:
+                yhat_d = yhat_blend_d
+
+            yweek_d = y_hist.shift(7).get(d, np.nan)
+            if pd.isna(yweek_d):
+                yweek_d = float(np.nanmean(y_train_full.values))
+
+            preds.append(yhat_d)
+            preds_base_only.append(base_pred_d)
+            preds_weekly.append(float(yweek_d))
+            preds_seasonal.append(float(seasonal_d))
+            preds_residual_only.append(yhat_residual_d)
+            preds_direct_only.append(yhat_direct_d)
+            strategy_used.append(chosen_strategy)
+
+            y_true_d = float(df_bt.loc[d, TARGET_COL])
+            if np.isfinite(y_true_d):
+                y_hist.loc[d] = y_true_d
+
+        pred_test_y = np.asarray(preds, dtype=float)
+        base_test_y = np.asarray(preds_base_only, dtype=float)
+        weekly_test_y = np.asarray(preds_weekly, dtype=float)
+        seasonal_test_y = np.asarray(preds_seasonal, dtype=float)
+        residual_test_y = np.asarray(preds_residual_only, dtype=float)
+        direct_test_y = np.asarray(preds_direct_only, dtype=float)
+
+        met = metrics_all(y_test.values, pred_test_y)
+        rmse_weekly = rmse(y_test.values, weekly_test_y)
+        rmse_base = rmse(y_test.values, base_test_y)
+        rmse_seasonal = rmse(y_test.values, seasonal_test_y)
+
+        skill_vs_weekly = (rmse_weekly - met["RMSE"]) / rmse_weekly if rmse_weekly > 0 else np.nan
+        skill_vs_base = (rmse_base - met["RMSE"]) / rmse_base if rmse_base > 0 else np.nan
+        skill_vs_seasonal = (rmse_seasonal - met["RMSE"]) / rmse_seasonal if rmse_seasonal > 0 else np.nan
+
+        rows.append({
+            "fold": int(fold_id),
+            "train_end": str(train_end.date()),
+            "test_start": str(test_start.date()),
+            "test_end": str(test_end.date()),
+            "MAE": met["MAE"],
+            "RMSE": met["RMSE"],
+            "R2": met["R2"],
+            "MAPE_%": met["MAPE_%"],
+            "RMSLE": met["RMSLE"],
+            "baseline_weekly_RMSE": float(rmse_weekly),
+            "baseline_improved_RMSE": float(rmse_base),
+            "baseline_seasonal_RMSE": float(rmse_seasonal),
+            "skill_vs_weekly_RMSE": float(skill_vs_weekly),
+            "skill_vs_improved_RMSE": float(skill_vs_base),
+            "skill_vs_seasonal_RMSE": float(skill_vs_seasonal),
+            "blend_w_residual": float(blend_w_residual),
+            "selected_strategy": chosen_strategy,
+            "val_RMSE_base_only": float(strategy_scores["base_only"]),
+            "val_RMSE_residual_only": float(strategy_scores["residual_only"]),
+            "val_RMSE_direct_only": float(strategy_scores["direct_only"]),
+            "val_RMSE_blend": float(strategy_scores["blend"]),
+            "val_RMSE_selected": float(chosen_val_rmse),
+        })
+
+        df_pred = pd.DataFrame({
+            "date": df_test.index,
+            "fold": int(fold_id),
+            "y_true": y_test.values.astype(float),
+            "y_pred": pred_test_y.astype(float),
+            "y_pred_residual_model": residual_test_y.astype(float),
+            "y_pred_direct_model": direct_test_y.astype(float),
+            f"{TARGET_COL}_observado": y_test.values.astype(float),
+            f"{TARGET_COL}_predito": pred_test_y.astype(float),
+            f"{TARGET_COL}_predito_modelo_residual": residual_test_y.astype(float),
+            f"{TARGET_COL}_predito_modelo_direto": direct_test_y.astype(float),
+            "baseline_weekly": weekly_test_y.astype(float),
+            "baseline_improved": base_test_y.astype(float),
+            "baseline_seasonal": seasonal_test_y.astype(float),
+            "selected_strategy": strategy_used,
+        }).set_index("date")
+        preds_concat.append(df_pred)
+
+        rmse_running.append(float(met["RMSE"]))
+        print(f"{print_prefix} Fold {fold_id:02d}/{folds[-1]['fold']:02d} concluido | RMSE={met['RMSE']:.4f} | R2={met['R2']:.4f} | estrategia={chosen_strategy}")
+
+        if (trial is not None) and HAVE_OPTUNA:
+            partial_score = float(np.mean(rmse_running))
+            trial.report(partial_score, step=fold_counter)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+    results_df = pd.DataFrame(rows)
+    if results_df.empty:
+        raise RuntimeError("Nenhum fold gerou resultado. Verifique datas e dados.")
+
+    pred_all = pd.concat(preds_concat).sort_index()
+
+    year_rows = []
+    for year, g in pred_all.groupby(pred_all.index.year):
+        met_y = metrics_all(g["y_true"].values, g["y_pred"].values)
+        rmse_week = rmse(g["y_true"].values, g["baseline_weekly"].values)
+        rmse_base = rmse(g["y_true"].values, g["baseline_improved"].values)
+        rmse_seasonal = rmse(g["y_true"].values, g["baseline_seasonal"].values)
+        skill_week = (rmse_week - met_y["RMSE"]) / rmse_week if rmse_week > 0 else np.nan
+        skill_base = (rmse_base - met_y["RMSE"]) / rmse_base if rmse_base > 0 else np.nan
+        skill_seasonal = (rmse_seasonal - met_y["RMSE"]) / rmse_seasonal if rmse_seasonal > 0 else np.nan
+        year_rows.append({
+            "year": int(year),
+            "target": TARGET_COL,
+            "MAE": met_y["MAE"],
+            "RMSE": met_y["RMSE"],
+            "R2": met_y["R2"],
+            "MAPE_%": met_y["MAPE_%"],
+            "RMSLE": met_y["RMSLE"],
+            "baseline_weekly_RMSE": float(rmse_week),
+            "baseline_improved_RMSE": float(rmse_base),
+            "baseline_seasonal_RMSE": float(rmse_seasonal),
+            "skill_vs_weekly_RMSE": float(skill_week),
+            "skill_vs_improved_RMSE": float(skill_base),
+            "skill_vs_seasonal_RMSE": float(skill_seasonal),
+            "n_days": int(len(g)),
+        })
+    year_df = pd.DataFrame(year_rows).sort_values("year")
+
+    mean_rmse = float(results_df["RMSE"].mean())
+    mean_r2 = float(results_df["R2"].mean())
+    mean_score = float(mean_rmse - 2.5 * results_df["skill_vs_improved_RMSE"].mean())
+
+    if out_dir is not None:
+        ensure_dir(out_dir)
+        results_df.to_csv(os.path.join(out_dir, "walkforward_results_by_fold.csv"), index=False)
+        pred_all.to_csv(os.path.join(out_dir, "walkforward_predictions_concat.csv"))
+        year_df.to_csv(os.path.join(out_dir, "walkforward_results_by_year.csv"), index=False)
+
+        summary = results_df[[
+            "MAE", "RMSE", "R2", "MAPE_%", "RMSLE",
+            "baseline_weekly_RMSE", "baseline_improved_RMSE", "baseline_seasonal_RMSE",
+            "skill_vs_weekly_RMSE", "skill_vs_improved_RMSE", "skill_vs_seasonal_RMSE",
+            "blend_w_residual", "val_RMSE_base_only", "val_RMSE_residual_only",
+            "val_RMSE_direct_only", "val_RMSE_blend", "val_RMSE_selected"
+        ]].agg(["mean", "std"]).T
+        summary.to_csv(os.path.join(out_dir, "walkforward_summary_mean_std.csv"))
+
+        with open(os.path.join(out_dir, "config_used.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+        if make_figs:
+            set_pub_style()
+            fig_dir = os.path.join(out_dir, FIGURES_SUBDIR)
+            ensure_dir(fig_dir)
+            pred_all_fig = pred_all.dropna(subset=["y_true", "y_pred"]).copy()
+            if pred_all_fig.empty:
+                raise RuntimeError("Nao ha dados validos para gerar as figuras.")
+
+            pred_all_fig["resid"] = pred_all_fig["y_true"] - pred_all_fig["y_pred"]
+            pred_all_fig["abs_error"] = np.abs(pred_all_fig["resid"])
+            pred_all_fig["sq_error"] = pred_all_fig["resid"] ** 2
+            pred_all_fig["year"] = pred_all_fig.index.year
+            pred_all_fig["month"] = pred_all_fig.index.month
+            saved_figs = []
+
+            fig = plt.figure(figsize=(11, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(pred_all_fig.index, pred_all_fig["y_true"], alpha=0.80, label=f"{TARGET_COL} observado")
+            ax.plot(pred_all_fig.index, pred_all_fig["y_pred"], alpha=0.80, label=f"{TARGET_COL} predito")
+            ax.set_title(f"Serie temporal completa, {TARGET_COL} observado vs predito"); ax.set_xlabel("Data"); ax.set_ylabel(TARGET_COL); ax.legend()
+            saved_figs.append(save_fig(fig, fig_dir, "fig01_timeseries_full"))
+
+            monthly = pred_all_fig[["y_true", "y_pred"]].resample("MS").mean()
+            fig = plt.figure(figsize=(11, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(monthly.index, monthly["y_true"], marker="o", linewidth=1.4, label=f"{TARGET_COL} observado")
+            ax.plot(monthly.index, monthly["y_pred"], marker="o", linewidth=1.4, label=f"{TARGET_COL} predito")
+            ax.set_title(f"Serie temporal mensal, {TARGET_COL} observado vs predito"); ax.set_xlabel("Mes"); ax.set_ylabel(TARGET_COL); ax.legend()
+            saved_figs.append(save_fig(fig, fig_dir, "fig02_timeseries_monthly_mean"))
+
+            yearly = pred_all_fig[["y_true", "y_pred"]].resample("YS").mean()
+            fig = plt.figure(figsize=(9, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(yearly.index.year, yearly["y_true"], marker="o", linewidth=1.6, label=f"{TARGET_COL} observado")
+            ax.plot(yearly.index.year, yearly["y_pred"], marker="o", linewidth=1.6, label=f"{TARGET_COL} predito")
+            ax.set_title(f"Serie temporal anual, {TARGET_COL} observado vs predito"); ax.set_xlabel("Ano"); ax.set_ylabel(TARGET_COL); ax.set_xticks(yearly.index.year.tolist()); ax.legend()
+            saved_figs.append(save_fig(fig, fig_dir, "fig03_timeseries_yearly_mean"))
+
+            fig = plt.figure(figsize=(5.6, 5.4)); ax = fig.add_subplot(111)
+            hb = ax.hexbin(pred_all_fig["y_true"], pred_all_fig["y_pred"], gridsize=42, mincnt=1)
+            lim0 = float(min(pred_all_fig["y_true"].min(), pred_all_fig["y_pred"].min()))
+            lim1 = float(max(pred_all_fig["y_true"].max(), pred_all_fig["y_pred"].max()))
+            ax.plot([lim0, lim1], [lim0, lim1], linestyle="--")
+            ax.set_title(f"Paridade, {TARGET_COL} observado vs predito"); ax.set_xlabel(f"{TARGET_COL} observado"); ax.set_ylabel(f"{TARGET_COL} predito")
+            cb = fig.colorbar(hb, ax=ax); cb.set_label("Contagem")
+            saved_figs.append(save_fig(fig, fig_dir, "fig04_parity_hexbin"))
+
+            fig = plt.figure(figsize=(11, 3.9)); ax = fig.add_subplot(111)
+            ax.plot(pred_all_fig.index, pred_all_fig["resid"], alpha=0.75); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+            ax.set_title(f"Residuos de {TARGET_COL} no tempo"); ax.set_xlabel("Data"); ax.set_ylabel("Residuo")
+            saved_figs.append(save_fig(fig, fig_dir, "fig05_residuals_timeseries"))
+
+            fig = plt.figure(figsize=(6.6, 4.8)); ax = fig.add_subplot(111)
+            ax.hist(pred_all_fig["resid"].values, bins=50); ax.axvline(0.0, linestyle="--", linewidth=1.0)
+            ax.set_title(f"Distribuicao dos residuos de {TARGET_COL}"); ax.set_xlabel("Residuo"); ax.set_ylabel("Frequencia")
+            saved_figs.append(save_fig(fig, fig_dir, "fig06_residuals_hist"))
+
+            fig = plt.figure(figsize=(6.6, 4.8)); ax = fig.add_subplot(111)
+            ax.scatter(pred_all_fig["y_pred"], pred_all_fig["resid"], s=14, alpha=0.45); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+            ax.set_title(f"Residuos vs valores preditos de {TARGET_COL}"); ax.set_xlabel(f"{TARGET_COL} predito"); ax.set_ylabel("Residuo")
+            saved_figs.append(save_fig(fig, fig_dir, "fig07_residuals_vs_fitted"))
+
+            fig = plt.figure(figsize=(11, 3.9)); ax = fig.add_subplot(111)
+            ax.plot(pred_all_fig.index, pred_all_fig["abs_error"], alpha=0.75)
+            ax.set_title(f"Erro absoluto de {TARGET_COL} no tempo"); ax.set_xlabel("Data"); ax.set_ylabel("Erro absoluto")
+            saved_figs.append(save_fig(fig, fig_dir, "fig08_abs_error_timeseries"))
+
+            rolling_rmse = np.sqrt(pred_all_fig["sq_error"].rolling(30, min_periods=10).mean())
+            fig = plt.figure(figsize=(11, 3.9)); ax = fig.add_subplot(111)
+            ax.plot(pred_all_fig.index, rolling_rmse, linewidth=1.4)
+            ax.set_title(f"Rolling RMSE de {TARGET_COL}, janela de 30 dias"); ax.set_xlabel("Data"); ax.set_ylabel("RMSE")
+            saved_figs.append(save_fig(fig, fig_dir, "fig09_rolling_rmse_30d"))
+
+            rolling_mae = pred_all_fig["abs_error"].rolling(30, min_periods=10).mean()
+            fig = plt.figure(figsize=(11, 3.9)); ax = fig.add_subplot(111)
+            ax.plot(pred_all_fig.index, rolling_mae, linewidth=1.4)
+            ax.set_title(f"Rolling MAE de {TARGET_COL}, janela de 30 dias"); ax.set_xlabel("Data"); ax.set_ylabel("MAE")
+            saved_figs.append(save_fig(fig, fig_dir, "fig10_rolling_mae_30d"))
+
+            month_mean = pred_all_fig.groupby("month")[["y_true", "y_pred"]].mean().reindex(range(1, 13))
+            fig = plt.figure(figsize=(8.8, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(range(1, 13), month_mean["y_true"], marker="o", linewidth=1.6, label=f"{TARGET_COL} observado")
+            ax.plot(range(1, 13), month_mean["y_pred"], marker="o", linewidth=1.6, label=f"{TARGET_COL} predito")
+            ax.set_title(f"Sazonalidade mensal de {TARGET_COL}, observado vs predito"); ax.set_xlabel("Mes"); ax.set_ylabel(TARGET_COL)
+            ax.set_xticks(range(1, 13)); ax.set_xticklabels(_month_labels_pt()); ax.legend()
+            saved_figs.append(save_fig(fig, fig_dir, "fig11_monthly_seasonality_observed_pred"))
+
+            month_data = [pred_all_fig.loc[pred_all_fig["month"] == m, "resid"].dropna().values for m in range(1, 13)]
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.boxplot(month_data, labels=_month_labels_pt(), showfliers=False); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+            ax.set_title(f"Distribuicao dos residuos de {TARGET_COL} por mes"); ax.set_xlabel("Mes"); ax.set_ylabel("Residuo")
+            saved_figs.append(save_fig(fig, fig_dir, "fig12_residuals_boxplot_by_month"))
+
+            xfold = results_df["fold"].values
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(xfold, results_df["RMSE"].values, marker="o", label="Modelo")
+            ax.plot(xfold, results_df["baseline_weekly_RMSE"].values, marker="o", label="Baseline semanal")
+            ax.plot(xfold, results_df["baseline_improved_RMSE"].values, marker="o", label="Baseline improved")
+            ax.plot(xfold, results_df["baseline_seasonal_RMSE"].values, marker="o", label="Baseline sazonal")
+            ax.set_title(f"RMSE por fold para {TARGET_COL}"); ax.set_xlabel("Fold"); ax.set_ylabel("RMSE"); ax.legend()
+            saved_figs.append(save_fig(fig, fig_dir, "fig13_rmse_by_fold"))
+
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(xfold, results_df["MAE"].values, marker="o")
+            ax.set_title(f"MAE por fold para {TARGET_COL}"); ax.set_xlabel("Fold"); ax.set_ylabel("MAE")
+            saved_figs.append(save_fig(fig, fig_dir, "fig14_mae_by_fold"))
+
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(xfold, results_df["R2"].values, marker="o"); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+            ax.set_title(f"R2 por fold para {TARGET_COL}"); ax.set_xlabel("Fold"); ax.set_ylabel("R2")
+            saved_figs.append(save_fig(fig, fig_dir, "fig15_r2_by_fold"))
+
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(xfold, results_df["skill_vs_improved_RMSE"].values, marker="o"); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+            ax.set_title(f"Skill vs baseline improved por fold para {TARGET_COL}"); ax.set_xlabel("Fold"); ax.set_ylabel("Skill")
+            saved_figs.append(save_fig(fig, fig_dir, "fig16_skill_improved_by_fold"))
+
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(xfold, results_df["MAPE_%"].values, marker="o")
+            ax.set_title(f"MAPE por fold para {TARGET_COL}"); ax.set_xlabel("Fold"); ax.set_ylabel("MAPE (%)")
+            saved_figs.append(save_fig(fig, fig_dir, "fig17_mape_by_fold"))
+
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(xfold, results_df["RMSLE"].values, marker="o")
+            ax.set_title(f"RMSLE por fold para {TARGET_COL}"); ax.set_xlabel("Fold"); ax.set_ylabel("RMSLE")
+            saved_figs.append(save_fig(fig, fig_dir, "fig18_rmsle_by_fold"))
+
+            strategy_counts = results_df["selected_strategy"].value_counts().reindex(["base_only", "residual_only", "direct_only", "blend"]).fillna(0)
+            fig = plt.figure(figsize=(7.2, 4.8)); ax = fig.add_subplot(111)
+            ax.bar(strategy_counts.index.astype(str).tolist(), strategy_counts.values)
+            ax.set_title("Estrategia escolhida por fold"); ax.set_xlabel("Estrategia"); ax.set_ylabel("Numero de folds")
+            saved_figs.append(save_fig(fig, fig_dir, "fig19_selected_strategy_counts"))
+
+            fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
+            ax.plot(xfold, results_df["blend_w_residual"].values, marker="o")
+            ax.set_title("Peso do blend residual por fold"); ax.set_xlabel("Fold"); ax.set_ylabel("Peso residual")
+            saved_figs.append(save_fig(fig, fig_dir, "fig20_blend_weight_by_fold"))
+
+            if not year_df.empty:
+                years = year_df["year"].astype(int).values
+
+                fig = plt.figure(figsize=(8.6, 4.8)); ax = fig.add_subplot(111)
+                ax.plot(years, year_df["RMSE"].values, marker="o", label="Modelo")
+                ax.plot(years, year_df["baseline_weekly_RMSE"].values, marker="o", label="Baseline semanal")
+                ax.plot(years, year_df["baseline_improved_RMSE"].values, marker="o", label="Baseline improved")
+                ax.plot(years, year_df["baseline_seasonal_RMSE"].values, marker="o", label="Baseline sazonal")
+                ax.set_title(f"RMSE por ano para {TARGET_COL}"); ax.set_xlabel("Ano"); ax.set_ylabel("RMSE"); ax.set_xticks(years.tolist()); ax.legend()
+                saved_figs.append(save_fig(fig, fig_dir, "fig21_rmse_by_year"))
+
+                fig = plt.figure(figsize=(8.6, 4.8)); ax = fig.add_subplot(111)
+                ax.plot(years, year_df["MAE"].values, marker="o")
+                ax.set_title(f"MAE por ano para {TARGET_COL}"); ax.set_xlabel("Ano"); ax.set_ylabel("MAE"); ax.set_xticks(years.tolist())
+                saved_figs.append(save_fig(fig, fig_dir, "fig22_mae_by_year"))
+
+                fig = plt.figure(figsize=(8.6, 4.8)); ax = fig.add_subplot(111)
+                ax.plot(years, year_df["R2"].values, marker="o"); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+                ax.set_title(f"R2 por ano para {TARGET_COL}"); ax.set_xlabel("Ano"); ax.set_ylabel("R2"); ax.set_xticks(years.tolist())
+                saved_figs.append(save_fig(fig, fig_dir, "fig23_r2_by_year"))
+
+                fig = plt.figure(figsize=(8.6, 4.8)); ax = fig.add_subplot(111)
+                ax.plot(years, year_df["skill_vs_improved_RMSE"].values, marker="o"); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+                ax.set_title(f"Skill vs baseline improved por ano para {TARGET_COL}"); ax.set_xlabel("Ano"); ax.set_ylabel("Skill"); ax.set_xticks(years.tolist())
+                saved_figs.append(save_fig(fig, fig_dir, "fig24_skill_improved_by_year"))
+
+                data_abs_year = [pred_all_fig.loc[pred_all_fig["year"] == y, "abs_error"].dropna().values for y in years]
+                fig = plt.figure(figsize=(8.8, 4.8)); ax = fig.add_subplot(111)
+                ax.boxplot(data_abs_year, labels=[str(y) for y in years], showfliers=False)
+                ax.set_title(f"Erro absoluto de {TARGET_COL} por ano"); ax.set_xlabel("Ano"); ax.set_ylabel("Erro absoluto")
+                saved_figs.append(save_fig(fig, fig_dir, "fig25_abs_error_boxplot_by_year"))
+
+                data_res_year = [pred_all_fig.loc[pred_all_fig["year"] == y, "resid"].dropna().values for y in years]
+                fig = plt.figure(figsize=(8.8, 4.8)); ax = fig.add_subplot(111)
+                ax.boxplot(data_res_year, labels=[str(y) for y in years], showfliers=False); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+                ax.set_title(f"Erro assinado de {TARGET_COL} por ano"); ax.set_xlabel("Ano"); ax.set_ylabel("Residuo")
+                saved_figs.append(save_fig(fig, fig_dir, "fig26_signed_error_boxplot_by_year"))
+
+            acf_lags = np.arange(1, 31)
+            acf_vals = [pred_all_fig["resid"].autocorr(lag=int(l)) for l in acf_lags]
+            fig = plt.figure(figsize=(8.8, 4.8)); ax = fig.add_subplot(111)
+            ax.bar(acf_lags, acf_vals); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+            ax.set_title(f"Autocorrelacao dos residuos de {TARGET_COL}"); ax.set_xlabel("Lag"); ax.set_ylabel("Autocorrelacao")
+            saved_figs.append(save_fig(fig, fig_dir, "fig27_residual_autocorrelation"))
+
+            hm_cols = ["RMSE", "MAE", "R2", "MAPE_%", "RMSLE", "skill_vs_improved_RMSE"]
+            hm = results_df[hm_cols].copy()
+            hm_plot = pd.DataFrame(index=hm.index)
+            for col in hm_cols:
+                colv = hm[col].astype(float).values
+                vmin = np.nanmin(colv); vmax = np.nanmax(colv)
+                if np.isclose(vmax, vmin):
+                    scaled = np.ones_like(colv, dtype=float) * 0.5
+                else:
+                    if col in ["R2", "skill_vs_improved_RMSE"]:
+                        scaled = (colv - vmin) / (vmax - vmin)
+                    else:
+                        scaled = (vmax - colv) / (vmax - vmin)
+                hm_plot[col] = scaled
+
+            fig = plt.figure(figsize=(10.4, 4.8)); ax = fig.add_subplot(111)
+            im = ax.imshow(hm_plot[hm_cols].T.values, aspect="auto")
+            ax.set_title("Heatmap de performance por fold"); ax.set_xlabel("Fold"); ax.set_ylabel("Metrica")
+            ax.set_xticks(np.arange(len(results_df))); ax.set_xticklabels(results_df["fold"].astype(int).astype(str).tolist(), rotation=90)
+            ax.set_yticks(np.arange(len(hm_cols))); ax.set_yticklabels(hm_cols)
+            fig.colorbar(im, ax=ax, label="Performance relativa")
+            saved_figs.append(save_fig(fig, fig_dir, "fig28_fold_performance_heatmap"))
+
+            try:
+                artifacts = build_env_only_explainability_artifacts(cfg=cfg, df_bt=df_bt, y_all=y_all)
+                if artifacts is not None:
+                    fi_env = artifacts["fi_env"].copy()
+                    fi_plot = fi_env.sort_values("Importancia", ascending=True)
+                    fig = plt.figure(figsize=(8.8, 6.2)); ax = fig.add_subplot(111)
+                    ax.barh(fi_plot["Variavel"], fi_plot["Importancia"])
+                    ax.set_title("Importancia do CatBoost residual, somente variaveis ambientais e meteorologicas")
+                    ax.set_xlabel("Importancia")
+                    ax.set_ylabel("Variavel")
+                    saved_figs.append(save_fig(fig, fig_dir, "fig29_env_feature_importance_only_raw"))
+                    fi_env.to_csv(os.path.join(fig_dir, "fig29_env_feature_importance_only_raw.csv"), index=False)
+
+                    shap_mean_abs = artifacts["shap_mean_abs_env"]
+                    shap_df = artifacts["shap_env"]
+                    X_env = artifacts["X_env"]
+                    if shap_mean_abs is not None and shap_df is not None and X_env is not None:
+                        s = shap_mean_abs.sort_values(ascending=True)
+                        fig = plt.figure(figsize=(8.8, 5.4)); ax = fig.add_subplot(111)
+                        ax.barh(s.index.tolist(), s.values)
+                        ax.set_title("SHAP medio absoluto, somente variaveis ambientais e meteorologicas")
+                        ax.set_xlabel("mean(|SHAP|)")
+                        ax.set_ylabel("Variavel")
+                        saved_figs.append(save_fig(fig, fig_dir, "fig30_shap_mean_abs_only_raw_env"))
+                        pd.DataFrame({"Variavel": shap_mean_abs.index.tolist(), "mean_abs_shap": shap_mean_abs.values}).to_csv(
+                            os.path.join(fig_dir, "fig30_shap_mean_abs_only_raw_env.csv"), index=False
+                        )
+
+                        rs = np.random.RandomState(RANDOM_SEED)
+                        top_features = shap_mean_abs.index.tolist()[:SHAP_CLASSIC_TOPK]
+                        fig = plt.figure(figsize=(8.8, 5.8)); ax = fig.add_subplot(111)
+                        for i, feat in enumerate(top_features):
+                            sv = pd.to_numeric(shap_df[feat], errors="coerce").values.astype(float)
+                            fv = pd.to_numeric(X_env[feat], errors="coerce").values.astype(float)
+                            mask = np.isfinite(sv)
+                            sv = sv[mask]; fv = fv[mask]
+                            if len(sv) == 0:
+                                continue
+                            yj = np.full(len(sv), i, dtype=float)
+                            jitter = (rs.rand(len(sv)) - 0.5) * 0.6
+                            if np.isfinite(fv).any():
+                                lo = np.nanpercentile(fv, 5); hi = np.nanpercentile(fv, 95)
+                                color_vals = (np.clip(fv, lo, hi) - lo) / (hi - lo + 1e-9)
+                            else:
+                                color_vals = np.zeros(len(sv), dtype=float)
+                            ax.scatter(sv, yj + jitter, c=color_vals, cmap="coolwarm", s=12, alpha=0.75, edgecolors="none")
+                        ax.axvline(0.0, linestyle="--", linewidth=1.0)
+                        ax.set_yticks(np.arange(len(top_features))); ax.set_yticklabels(top_features); ax.invert_yaxis()
+                        ax.set_xlabel("SHAP value")
+                        ax.set_title("SHAP summary beeswarm, somente variaveis ambientais e meteorologicas")
+                        sm = plt.cm.ScalarMappable(cmap="coolwarm", norm=plt.Normalize(0, 1)); sm.set_array([])
+                        cb = fig.colorbar(sm, ax=ax); cb.set_label("Valor da variavel, baixo para alto")
+                        saved_figs.append(save_fig(fig, fig_dir, "fig31_shap_beeswarm_only_raw_env"))
+
+                        top2 = shap_mean_abs.index.tolist()[:2]
+                        for rank, feat in enumerate(top2, start=1):
+                            xv = pd.to_numeric(X_env[feat], errors="coerce")
+                            sv = pd.to_numeric(shap_df[feat], errors="coerce")
+                            mask = xv.notna() & sv.notna()
+                            if mask.sum() >= 20:
+                                xv = xv.loc[mask]; sv = sv.loc[mask]
+                                order = np.argsort(xv.values)
+                                xv_sorted = xv.values[order]; sv_sorted = sv.values[order]
+                                roll_n = max(15, int(len(xv_sorted) * 0.05))
+                                smooth = pd.Series(sv_sorted).rolling(roll_n, min_periods=max(5, roll_n // 3)).mean()
+                                fig = plt.figure(figsize=(7.6, 5.2)); ax = fig.add_subplot(111)
+                                ax.scatter(xv, sv, s=14, alpha=0.45)
+                                ax.plot(xv_sorted, smooth.values, linewidth=2.0)
+                                ax.axhline(0.0, linestyle="--", linewidth=1.0)
+                                ax.set_title(f"Dependence plot SHAP, {feat}, somente variavel ambiental ou meteorologica")
+                                ax.set_xlabel(feat)
+                                ax.set_ylabel(f"SHAP de {feat}")
+                                saved_figs.append(save_fig(fig, fig_dir, f"fig3{1+rank}_shap_dependence_top{rank}_only_raw_env"))
+            except Exception as e:
+                print("Aviso: explainability falhou, seguindo sem interromper.", e)
+
+            manifest_path = os.path.join(fig_dir, "figures_generated.txt")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write("Figuras geradas:\n")
+                for png_path, pdf_path in saved_figs:
+                    f.write(f"PNG: {png_path}\n")
+                    if pdf_path is not None:
+                        f.write(f"PDF: {pdf_path}\n")
+                    f.write("\n")
+
+            print("\n===== FIGURAS SALVAS =====")
+            print("Pasta das figuras:", os.path.abspath(fig_dir))
+            print("Total de figuras:", len(saved_figs))
+
+            # ----------------------------------------------------
+            # NOVO: figuras suplementares (34 a 47)
+            # ----------------------------------------------------
+            try:
+                build_supplementary_figures(
+                    df_bt=df_bt,
+                    pred_all=pred_all,
+                    results_df=results_df,
+                    cfg=cfg,
+                    y_all=y_all,
+                    fig_dir=fig_dir,
+                )
+            except Exception as e:
+                print("Aviso: figuras suplementares falharam, seguindo:", e)
+
+    return {
+        "results_df": results_df,
+        "pred_all": pred_all,
+        "year_df": year_df,
+        "mean_rmse": mean_rmse,
+        "mean_r2": mean_r2,
+        "mean_score": mean_score,
+    }
+
+# ============================================================
+# 10) MAIN
+# ============================================================
+
+
+def main():
+    t0 = time.time()
+
+    if not HAVE_CATBOOST:
+        raise RuntimeError("CatBoost nao foi carregado. Instale com: pip install catboost")
+
+    df_bt_raw = load_raw_df()
+
+    bt_start = pd.Timestamp(df_bt_raw.index.min()).normalize()
+    bt_end = pd.Timestamp(df_bt_raw.index.max()).normalize()
+    _test_start = TEST_START if TEST_START else (bt_start + pd.DateOffset(years=1)).strftime("%Y-%m-%d")
+    _test_end = TEST_END if TEST_END else bt_end.strftime("%Y-%m-%d")
+
+    folds = make_folds_bymonths(df_bt_raw.index, test_start=_test_start, test_end=_test_end, months=FOLD_MONTHS)
+
+    print("\nJanelas (walk-forward):")
+    for f in folds[:12]:
+        print(f"{f['fold']:02d}) train<= {f['train_end'].date()} | test {f['test_start'].date()} -> {f['test_end'].date()}")
+    if len(folds) > 12:
+        print("... total de folds:", len(folds))
+
+    if RUN_HPO:
+        print("\nHPO leve ativado.")
+        hpo = run_optuna_hpo(df_bt_raw, folds)
+        best_cfg = CURATED_CFG.copy()
+        if hpo.get("best_cfg") is not None:
+            best_cfg = hpo["best_cfg"]
+        print("\n===== MELHOR RESULTADO HPO =====")
+        print("Best weighted score:", hpo.get("best_score"))
+        print("Best mean R2:", hpo.get("best_r2"))
+        print(json.dumps(best_cfg, ensure_ascii=False, indent=2))
+    else:
+        best_cfg = CURATED_CFG.copy()
+        print("\nUsando configuracao curada, baseada no GPT3 vencedor, com melhorias cirurgicas.")
+        print(json.dumps(best_cfg, ensure_ascii=False, indent=2))
+
+    out_dir = build_out_dir(tag="FINAL_SURGICAL_ENV_ONLY")
+    ensure_dir(out_dir)
+
+    with open(os.path.join(out_dir, "run_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "mode": "CURATED" if not RUN_HPO else "OPTUNA_OR_CURATED",
+                "backend": "CATBOOST_RESIDUAL_DIRECT_WITH_VALIDATION_FALLBACK_ENV_ONLY_EXPLAINABILITY",
+                "target": TARGET_COL,
+                "env_features_only_in_explainability": RAW_FEATURES,
+                "config": best_cfg,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print("\n===== FINAL RUN =====")
+    final = run_walkforward_once(
+        df_bt_raw=df_bt_raw,
+        cfg=best_cfg,
+        folds=folds,
+        trial=None,
+        out_dir=out_dir,
+        make_figs=True,
+        mode="final",
+    )
+
+    print("\n===== RESULTADOS POR ANO =====")
+    print(final["year_df"].to_string(index=False))
+    print("\nAlvo avaliado nos resultados:", TARGET_COL)
+    print("Variaveis mostradas nas figuras de explicabilidade:", ", ".join(RAW_FEATURES))
+    print("\nArquivos salvos em:", os.path.abspath(out_dir))
+    print("Pasta das figuras:", os.path.abspath(os.path.join(out_dir, FIGURES_SUBDIR)))
+    print("Tempo total:", f"{time.time() - t0:.1f} s")
+
+
+if __name__ == "__main__":
+    main()
+
