@@ -1,0 +1,17 @@
+# Dependencias do pipeline de previsao de internacoes respiratorias
+# Instale com  pip install -r requirements.txt
+
+pandas
+numpy
+scikit-learn
+scipy
+matplotlib
+catboost
+
+# Leitura do arquivo .xlsx pelo pandas
+openpyxl
+
+# Usado apenas se a busca bayesiana de hiperparametros for ativada
+# com RUN_HPO = True. Nao e necessario para reproduzir os resultados
+# publicados neste repositorio.
+optuna
