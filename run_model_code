@@ -1,29 +1,49 @@
 # -*- coding: utf-8 -*-
 """
-Pipeline completo, walk-forward, base ElasticNet + camada CatBoost,
-para previsao diaria de internacoes por doencas respiratorias em Sao Paulo.
-Versao final com figuras suplementares.
+Previsao diaria de internacoes por doencas respiratorias em Sao Paulo (2017-2022).
 
-Acrescimos em relacao a versao anterior:
-- fig34_caracterizacao_HOSPCIDX_serie_diaria
-- fig35_caracterizacao_12_variaveis_ambientais
-- fig36_matriz_correlacao_preditoras_HOSPCIDX
-- fig37_zoom_pandemia_1T2020
-- fig38_zoom_pandemia_pico_mai_jun_2020
-- fig39_zoom_recuperacao_2022
-- fig40_modelo_vs_baselines_zoom_pandemia
-- fig41_qq_plot_residuos
-- fig42_shap_dependence_CO
-- fig43_shap_dependence_NO2
-- fig44_boxplot_mensal_PM2_5
-- fig45_boxplot_mensal_TEMPMED
-- fig46_boxplot_mensal_CO
-- fig47_diagrama_PRISMA_revisao_sistematica
+Modelo hibrido em duas camadas. Uma base linear regularizada, ElasticNet, capta a
+estrutura temporal do proprio historico de internacoes. Uma camada de gradient
+boosting, CatBoost, corrige os residuos dessa base a partir de doze variaveis
+ambientais e meteorologicas brutas e de suas transformacoes.
 
-Todas as novas figuras sao geradas dentro da mesma pasta de saida ja usada
-pelo pipeline, em Downloads, no mesmo run_folder com timestamp.
+A avaliacao usa validacao walk-forward com janelas bimestrais e reajuste completo
+do modelo a cada fold, sem qualquer uso de informacao futura. Em cada fold quatro
+estrategias competem em uma validacao interna, base_only, residual_only,
+direct_only e blend, e a base linear so e substituida quando a melhora relativa de
+RMSE supera o limiar de parcimonia de 0,5 por cento.
+
+A interpretabilidade usa SHAP e importancia por PredictionValuesChange, calculadas
+em um modelo auxiliar treinado sobre os residuos da base linear e restrito as doze
+variaveis ambientais brutas.
+
+Alvo
+    HOSPCIDX, contagem diaria de internacoes do Capitulo X da CID-10, doencas do
+    aparelho respiratorio, no municipio de Sao Paulo.
+
+Fontes de dados
+    SIH/SUS para internacoes, CETESB para poluentes atmosfericos e INMET para
+    variaveis meteorologicas.
+
+Uso
+    python src/pipeline_walkforward.py --data data/dataset_sp_2017_2022.xlsx
+
+Autor
+    Gabriel Fuscald Scursone
+
+Orientacao
+    Profa. Dra. Diana Francisca Adamatti
+
+Programa
+    Pos-Graduacao em Modelagem Computacional, Universidade Federal do Rio Grande
+
+Licenca
+    MIT, ver arquivo LICENSE na raiz do repositorio.
 """
 
+from __future__ import annotations
+
+import argparse
 import os
 import sys
 import json
@@ -49,17 +69,35 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from scipy import stats as scipy_stats
 
-warnings.filterwarnings("ignore")
+# Supressao dirigida. O ElasticNet emite avisos de convergencia em folds curtos e
+# o pandas emite avisos de versao futura em operacoes de reindexacao. Os demais
+# avisos continuam visiveis.
+warnings.filterwarnings("ignore", category=FutureWarning)
+try:
+    from sklearn.exceptions import ConvergenceWarning
+
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+except ImportError:
+    pass
 
 # ============================================================
-# 0) AUTO-INSTALL
+# 0) DEPENDENCIAS
 # ============================================================
+# CatBoost e obrigatorio para rodar o pipeline. Optuna so e necessario quando a
+# busca de hiperparametros esta ativada, o que nao foi o caso da execucao
+# reportada na tese.
+#
+# A funcao auxiliar _pip_install verifica e instala a dependencia ausente pelo
+# gerenciador padrao pip. Ela e mantida por fidelidade ao ambiente descrito na
+# tese. Em ambientes gerenciados, prefira instalar antes com
+# 'pip install -r requirements.txt' e deixar AUTO_INSTALL_CATBOOST em False.
 
 AUTO_INSTALL_CATBOOST = True
 AUTO_INSTALL_OPTUNA = False
 
 
 def _pip_install(pkg: str) -> bool:
+    """Instala um pacote ausente pelo pip e informa se a instalacao funcionou."""
     try:
         print(f"[pip] Instalando {pkg} ...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
@@ -74,101 +112,176 @@ CatBoostRegressor = None
 Pool = None
 try:
     from catboost import CatBoostRegressor, Pool  # type: ignore
+
     HAVE_CATBOOST = True
-except Exception:
+except ImportError:
     if AUTO_INSTALL_CATBOOST and _pip_install("catboost"):
         from catboost import CatBoostRegressor, Pool  # type: ignore
+
         HAVE_CATBOOST = True
 
 HAVE_OPTUNA = False
 optuna = None
 try:
     import optuna  # type: ignore
+
     HAVE_OPTUNA = True
-except Exception:
+except ImportError:
     if AUTO_INSTALL_OPTUNA and _pip_install("optuna"):
         import optuna  # type: ignore
+
         HAVE_OPTUNA = True
+
 
 # ============================================================
 # 1) CONFIG
 # ============================================================
 
-EXCEL_PATH = r"C:\Users\Usuario\Desktop\0_ArPol_VarMet_Hosp_Mort_2017a2022_SP_CENARIO_COVID_ONDAS_TODOS_HOSP_MORT_CLEAN.xlsx"
-SHEET_NAME = None
-DATE_COL = None
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Funciona com o script dentro de src/ ou direto na raiz do repositorio.
+PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "src" else SCRIPT_DIR
+
+DEFAULT_DATA_NAME = "dataset_sp_2017_2022.xlsx"
+
+
+def _resolve_default_data() -> str:
+    """Procura a planilha nos lugares mais provaveis, sem exigir um nome fixo."""
+    preferido = PROJECT_ROOT / "data" / DEFAULT_DATA_NAME
+    if preferido.exists():
+        return str(preferido)
+
+    for pasta in (PROJECT_ROOT / "data", PROJECT_ROOT):
+        if pasta.is_dir():
+            planilhas = sorted(
+                x for x in pasta.glob("*.xlsx") if not x.name.startswith("~$")
+            )
+            if len(planilhas) == 1:
+                return str(planilhas[0])
+
+    return str(preferido)
+
+
+# Caminho padrao do conjunto de dados. Pode ser sobrescrito por --data.
+EXCEL_PATH = _resolve_default_data()
+
+# Aba unica do arquivo. None faz o pandas ler a primeira aba.
+SHEET_NAME = "data_clean"
+
+# Coluna de data declarada de forma explicita. Deixar None aciona a deteccao
+# automatica em guess_date_col, que e mantida apenas como plano de contingencia.
+DATE_COL = "Data"
+
+# Alvo. Capitulo X da CID-10, doencas do aparelho respiratorio.
 TARGET_COL = "HOSPCIDX"
 
+# Doze variaveis exogenas. Seis poluentes da CETESB e seis variaveis
+# meteorologicas do INMET. Sao as unicas variaveis externas usadas pelo modelo e
+# as unicas que aparecem nas figuras de interpretabilidade.
 RAW_FEATURES = [
     "PM10", "PM2_5", "O3", "NO2", "SO2", "CO",
     "TEMPMED", "UMIDRELAT", "PRECIPIT", "RADIACAO", "VELVENTO", "PRESSAOATM"
 ]
 
-BACKTEST_START = None
-BACKTEST_END = None
-TEST_START = "2018-01-01"
-TEST_END = None
-FOLD_MONTHS = 2
-INNER_VAL_DAYS = 75
-PANDEMIC_START = "2020-03-01"
+# --- Recorte temporal e janelas do walk-forward ---------------------------
+BACKTEST_START = None        # None usa o primeiro dia disponivel
+BACKTEST_END = None          # None usa o ultimo dia disponivel
+TEST_START = "2018-01-01"    # 2017 fica reservado como historico minimo
+TEST_END = None              # None usa o ultimo dia disponivel
+FOLD_MONTHS = 2              # janela de teste bimestral, gera 30 folds
+INNER_VAL_DAYS = 75          # validacao interna no fim do treino de cada fold
+PANDEMIC_START = "2020-03-01"  # inicio do indicador binario de pandemia
 
 RANDOM_SEED = 42
-SAVE_TO_DOWNLOADS = True
-USE_TIMESTAMP_RUNFOLDER = True
-RUN_FOLDER_NAME_PREFIX = "walkforward_R20_GPT3_SURGICAL_ENV_ONLY"
 
+# Saida gravada dentro do proprio repositorio, em outputs/, que esta ignorada
+# pelo git. Pode ser sobrescrito por --outdir.
+OUTPUT_ROOT = str(PROJECT_ROOT / "outputs")
+USE_TIMESTAMP_RUNFOLDER = True
+RUN_FOLDER_NAME_PREFIX = "walkforward_elasticnet_catboost"
+
+# Desligado na execucao reportada na tese. A infraestrutura de busca bayesiana
+# esta implementada e pode ser ativada com --run-hpo.
 RUN_HPO = False
 MAX_TRIALS = 8
 TIME_BUDGET_HOURS = 0.7
-OPTUNA_DB_PATH = "optuna_walkforward_r20_gpt3_surgical_env_only.db"
-OPTUNA_STUDY_NAME = "walkforward_r20_gpt3_surgical_env_only"
+OPTUNA_DB_PATH = "optuna_walkforward.db"
+OPTUNA_STUDY_NAME = "walkforward_elasticnet_catboost"
 OPTUNA_N_JOBS = 1
+# Numero pedido de folds na busca rapida. A funcao que os seleciona acumula a
+# amostra uniforme e os folds ancora em um set, entao devolve nove folds.
 HPO_FAST_FOLDS = 6
 
-CAT_ITER_HPO = 350
+# --- Orcamento de treino do CatBoost --------------------------------------
+CAT_ITER_HPO = 350           # usado apenas durante a busca de hiperparametros
 CAT_EARLY_STOP_HPO = 45
-CAT_ITER_FINAL = 1200
-CAT_EARLY_STOP_FINAL = 90
-FINAL_REFIT_VAL_DAYS = 45
+CAT_ITER_FINAL = 1200        # teto de iteracoes no treino final
+CAT_EARLY_STOP_FINAL = 90    # paciencia do early stopping
+FINAL_REFIT_VAL_DAYS = 45    # holdout de cauda usado no reajuste final
 
+# Ensemble de duas sementes, promediado. O modelo direto usa as mesmas sementes
+# deslocadas em 1000, o que da 1042 e 1052.
 USE_FINAL_ENSEMBLE = True
 FINAL_ENSEMBLE_SEEDS = [42, 52]
 
+# --- Selecao de estrategia -------------------------------------------------
+# Grade de pesos do componente residual na estrategia blend.
 DIRECT_BLEND_GRID = [0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 1.0]
+# Limiar de parcimonia. A base linear so e substituida quando a melhora relativa
+# de RMSE na validacao interna supera 0,5 por cento.
 MIN_REL_IMPROVEMENT_TO_REPLACE_BASE = 0.005
 
-SHOW_FIGS = False
+# --- Figuras ---------------------------------------------------------------
+SHOW_FIGS = False            # execucao sem interface grafica, backend Agg
 SHOW_BLOCKING = False
-SAVE_FIGS_AS_PDF = True
+SAVE_FIGS_AS_PDF = True      # saida dupla, PNG a 300 dpi e PDF vetorial
 FIGURES_SUBDIR = "figures_env_meteo_only"
+# Numero de variaveis mostradas no beeswarm. Como sao doze variaveis brutas, o
+# grafico exibe todas.
 SHAP_CLASSIC_TOPK = 12
-EXPLAINABILITY_ONLY_RAW_ENV = True
 
 # ============================================================
 # 2) CURATED CONFIG
 # ============================================================
 
+# Configuracao fixa usada na execucao reportada na tese. Um registro em JSON
+# desta mesma configuracao esta em config/config_curated.json.
 CURATED_CFG = {
-    "exog_fill_mode": "ffill_rolling",
-    "exog_ffill_limit": 7,
-    "add_missing_flags": True,
+    # Tratamento das variaveis exogenas
+    "exog_fill_mode": "ffill_rolling",   # preenchimento causal, sem olhar o futuro
+    "exog_ffill_limit": 7,               # limite do forward fill, em dias
+    "add_missing_flags": True,           # cria colunas indicadoras de ausencia
     "exog_feature_set": "raw_lags_light",
-    "exog_known_lag_days": 0,
+    "exog_known_lag_days": 0,            # medicao do proprio dia esta disponivel
+
+    # Camada base, linear
     "base_model_kind": "elasticnet",
     "base_alpha": 0.0045,
-    "elastic_l1_ratio": 0.08,
+    "elastic_l1_ratio": 0.08,            # baixo, aproxima o modelo de uma Ridge
+
+    # Atributos temporais do alvo. As defasagens de 364 e 365 dias captam o
+    # ciclo anual das internacoes.
     "target_lags": (1, 2, 3, 4, 5, 6, 7, 10, 14, 21, 28, 35, 42, 56, 84, 364, 365),
     "roll_windows": (7, 14, 28),
-    "add_context": True,
-    "add_basepred": True,
+    "add_context": True,                 # calendario e componentes sazonais
+    "add_basepred": True,                # previsao da base entra na camada residual
     "add_seasonal_baseline": True,
+
+    # Pesos crescem de 0,85 a 1,20 ao longo do treino, dando mais peso ao passado
+    # recente sem descartar o historico antigo.
     "use_recency_weights": True,
     "recency_weight_power": 1.25,
+
+    # Camada de correcao, CatBoost
     "depth": 6,
     "learning_rate": 0.030,
     "l2_leaf_reg": 3.0,
+    # Lido apenas quando bootstrap_type nao e Bayesian. Com a configuracao atual
+    # o CatBoost usa bagging_temperature e ignora subsample.
     "subsample": 0.85,
     "rsm": 0.85,
+    # Sob a politica de crescimento padrao do CatBoost, SymmetricTree, este
+    # parametro tende a ser inerte. Mantido por fidelidade a execucao original.
     "min_data_in_leaf": 40,
     "random_strength": 0.40,
     "bootstrap_type": "Bayesian",
@@ -312,18 +425,6 @@ def make_folds_bymonths(index, test_start=None, test_end=None, months=2):
     return folds
 
 
-def get_downloads_dir() -> Path:
-    home = Path(os.environ.get("USERPROFILE", str(Path.home())))
-    candidates = [
-        home / "Downloads",
-        home / "Download",
-        home / "OneDrive" / "Downloads",
-        home / "OneDrive" / "Download",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return home / "Downloads"
 
 
 def pandemic_flag(dti: pd.DatetimeIndex, start=PANDEMIC_START):
@@ -332,12 +433,9 @@ def pandemic_flag(dti: pd.DatetimeIndex, start=PANDEMIC_START):
 
 
 def build_out_dir(tag: str) -> str:
-    if SAVE_TO_DOWNLOADS:
-        downloads = get_downloads_dir()
-        run_tag = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S") if USE_TIMESTAMP_RUNFOLDER else ""
-        name = f"{RUN_FOLDER_NAME_PREFIX}_{tag}" + (f"_{run_tag}" if run_tag else "")
-        return str(downloads / name)
-    return str(Path("reports_walkforward") / f"{RUN_FOLDER_NAME_PREFIX}_{tag}")
+    run_tag = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S") if USE_TIMESTAMP_RUNFOLDER else ""
+    name = f"{RUN_FOLDER_NAME_PREFIX}_{tag}" + (f"_{run_tag}" if run_tag else "")
+    return str(Path(OUTPUT_ROOT) / name)
 
 
 def make_time_weights(index: pd.DatetimeIndex, min_w: float = 0.85, max_w: float = 1.20, power: float = 1.25) -> np.ndarray:
@@ -400,6 +498,18 @@ def _month_labels_pt():
     return ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
 
 
+def boxplot_com_rotulos(ax, dados, rotulos, **kwargs):
+    """Desenha um boxplot rotulado sem depender da versao do matplotlib.
+
+    O argumento labels foi renomeado para tick_labels na versao 3.9 e o nome
+    antigo sera removido. Esta funcao usa o nome disponivel no ambiente.
+    """
+    try:
+        return ax.boxplot(dados, tick_labels=rotulos, **kwargs)
+    except TypeError:
+        return ax.boxplot(dados, labels=rotulos, **kwargs)
+
+
 def select_representative_hpo_folds(folds: List[Dict[str, Any]], n_select: int = 6) -> List[Dict[str, Any]]:
     if len(folds) <= n_select:
         return folds
@@ -452,6 +562,10 @@ def choose_best_blend_weight(y_true, pred_residual, pred_direct, pred_base, grid
     pred_direct = np.asarray(pred_direct, dtype=float)
     pred_base = np.asarray(pred_base, dtype=float)
 
+    # O ponto de partida e a propria base. Se nenhum peso da grade superar o RMSE
+    # da base, a funcao devolve pred_base e peso 1,0. Nesse caso a candidata
+    # blend fica identica a base_only, e o peso registrado no CSV nao indica um
+    # blend efetivamente aplicado.
     best_w = 1.0
     best_pred = pred_base.copy()
     best_rmse = rmse(y_true, pred_base)
@@ -505,11 +619,19 @@ def fit_cat_model_with_tail_early_stop(model, X_train, y_train, w_train=None, ho
 
 def load_raw_df() -> pd.DataFrame:
     if not os.path.exists(EXCEL_PATH):
-        raise FileNotFoundError(f"Arquivo nao encontrado: {EXCEL_PATH}")
+        raise FileNotFoundError(
+            f"Conjunto de dados nao encontrado em '{EXCEL_PATH}'.\n"
+            "Informe o caminho com --data, por exemplo:\n"
+            "    python pipeline_walkforward.py --data caminho/para/planilha.xlsx"
+        )
 
     print("Lendo arquivo:", EXCEL_PATH)
     _sheet = 0 if SHEET_NAME is None else SHEET_NAME
-    df_obj = pd.read_excel(EXCEL_PATH, sheet_name=_sheet)
+    try:
+        df_obj = pd.read_excel(EXCEL_PATH, sheet_name=_sheet)
+    except ValueError:
+        print(f"Aba '{_sheet}' nao encontrada, lendo a primeira aba do arquivo.")
+        df_obj = pd.read_excel(EXCEL_PATH, sheet_name=0)
 
     if isinstance(df_obj, dict):
         first_key = next(iter(df_obj.keys()))
@@ -1020,11 +1142,11 @@ def build_env_only_explainability_artifacts(
     }
 
 # ============================================================
-# 8B) FIGURAS SUPLEMENTARES (NOVO BLOCO)
+# 8B) FIGURAS DE CARACTERIZACAO, RECORTE TEMPORAL E DIAGNOSTICO
 # ============================================================
-# Este bloco gera as figuras adicionais recomendadas para a tese.
-# Nada do pipeline principal eh alterado. As figuras sao salvas
-# na MESMA pasta FIGURES_SUBDIR do run em Downloads.
+# Este bloco gera as figuras de caracterizacao, de recorte temporal e de
+# diagnostico usadas na tese. O pipeline principal nao e alterado. As figuras
+# sao gravadas na mesma pasta FIGURES_SUBDIR da execucao.
 # ============================================================
 
 
@@ -1036,13 +1158,16 @@ def _save_supp(fig, fig_dir: str, name: str, saved_list):
 def build_supplementary_figures(
     df_bt: pd.DataFrame,
     pred_all: pd.DataFrame,
-    results_df: pd.DataFrame,
     cfg: Dict[str, Any],
     y_all: pd.Series,
     fig_dir: str,
+    artifacts: Optional[Dict[str, Any]] = None,
 ) -> List[Tuple[str, Optional[str]]]:
-    """
-    Gera as figuras suplementares 34 a 47, todas dentro de fig_dir.
+    """Gera as figuras 34 a 47 dentro de fig_dir.
+
+    O argumento artifacts recebe o resultado ja calculado de
+    build_env_only_explainability_artifacts. Passa-lo evita treinar o modelo de
+    interpretabilidade uma segunda vez sobre a serie inteira.
     """
     set_pub_style()
     ensure_dir(fig_dir)
@@ -1150,7 +1275,8 @@ def build_supplementary_figures(
     # ----------------------------------------------------------
 
     try:
-        artifacts = build_env_only_explainability_artifacts(cfg=cfg, df_bt=df_bt, y_all=y_all)
+        if artifacts is None:
+            artifacts = build_env_only_explainability_artifacts(cfg=cfg, df_bt=df_bt, y_all=y_all)
         if artifacts is not None and artifacts.get("shap_env") is not None:
             shap_df = artifacts["shap_env"]
             X_env = artifacts["X_env"]
@@ -1191,7 +1317,7 @@ def build_supplementary_figures(
         meses = pd.DatetimeIndex(serie.index).month
         data_mes = [serie.values[meses == m] for m in range(1, 13)]
         fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
-        ax.boxplot(data_mes, labels=_month_labels_pt(), showfliers=False)
+        boxplot_com_rotulos(ax, data_mes, _month_labels_pt(), showfliers=False)
         ax.set_title(titulo)
         ax.set_xlabel("Mes"); ax.set_ylabel(ylabel)
         _save_supp(fig, fig_dir, nome, saved)
@@ -1749,7 +1875,7 @@ def run_walkforward_once(
 
             month_data = [pred_all_fig.loc[pred_all_fig["month"] == m, "resid"].dropna().values for m in range(1, 13)]
             fig = plt.figure(figsize=(9.2, 4.8)); ax = fig.add_subplot(111)
-            ax.boxplot(month_data, labels=_month_labels_pt(), showfliers=False); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+            boxplot_com_rotulos(ax, month_data, _month_labels_pt(), showfliers=False); ax.axhline(0.0, linestyle="--", linewidth=1.0)
             ax.set_title(f"Distribuicao dos residuos de {TARGET_COL} por mes"); ax.set_xlabel("Mes"); ax.set_ylabel("Residuo")
             saved_figs.append(save_fig(fig, fig_dir, "fig12_residuals_boxplot_by_month"))
 
@@ -1826,13 +1952,13 @@ def run_walkforward_once(
 
                 data_abs_year = [pred_all_fig.loc[pred_all_fig["year"] == y, "abs_error"].dropna().values for y in years]
                 fig = plt.figure(figsize=(8.8, 4.8)); ax = fig.add_subplot(111)
-                ax.boxplot(data_abs_year, labels=[str(y) for y in years], showfliers=False)
+                boxplot_com_rotulos(ax, data_abs_year, [str(y) for y in years], showfliers=False)
                 ax.set_title(f"Erro absoluto de {TARGET_COL} por ano"); ax.set_xlabel("Ano"); ax.set_ylabel("Erro absoluto")
                 saved_figs.append(save_fig(fig, fig_dir, "fig25_abs_error_boxplot_by_year"))
 
                 data_res_year = [pred_all_fig.loc[pred_all_fig["year"] == y, "resid"].dropna().values for y in years]
                 fig = plt.figure(figsize=(8.8, 4.8)); ax = fig.add_subplot(111)
-                ax.boxplot(data_res_year, labels=[str(y) for y in years], showfliers=False); ax.axhline(0.0, linestyle="--", linewidth=1.0)
+                boxplot_com_rotulos(ax, data_res_year, [str(y) for y in years], showfliers=False); ax.axhline(0.0, linestyle="--", linewidth=1.0)
                 ax.set_title(f"Erro assinado de {TARGET_COL} por ano"); ax.set_xlabel("Ano"); ax.set_ylabel("Residuo")
                 saved_figs.append(save_fig(fig, fig_dir, "fig26_signed_error_boxplot_by_year"))
 
@@ -1866,10 +1992,12 @@ def run_walkforward_once(
             fig.colorbar(im, ax=ax, label="Performance relativa")
             saved_figs.append(save_fig(fig, fig_dir, "fig28_fold_performance_heatmap"))
 
+            # Calculado uma unica vez e reaproveitado no bloco seguinte de figuras.
+            artifacts_env = None
             try:
-                artifacts = build_env_only_explainability_artifacts(cfg=cfg, df_bt=df_bt, y_all=y_all)
-                if artifacts is not None:
-                    fi_env = artifacts["fi_env"].copy()
+                artifacts_env = build_env_only_explainability_artifacts(cfg=cfg, df_bt=df_bt, y_all=y_all)
+                if artifacts_env is not None:
+                    fi_env = artifacts_env["fi_env"].copy()
                     fi_plot = fi_env.sort_values("Importancia", ascending=True)
                     fig = plt.figure(figsize=(8.8, 6.2)); ax = fig.add_subplot(111)
                     ax.barh(fi_plot["Variavel"], fi_plot["Importancia"])
@@ -1879,9 +2007,9 @@ def run_walkforward_once(
                     saved_figs.append(save_fig(fig, fig_dir, "fig29_env_feature_importance_only_raw"))
                     fi_env.to_csv(os.path.join(fig_dir, "fig29_env_feature_importance_only_raw.csv"), index=False)
 
-                    shap_mean_abs = artifacts["shap_mean_abs_env"]
-                    shap_df = artifacts["shap_env"]
-                    X_env = artifacts["X_env"]
+                    shap_mean_abs = artifacts_env["shap_mean_abs_env"]
+                    shap_df = artifacts_env["shap_env"]
+                    X_env = artifacts_env["X_env"]
                     if shap_mean_abs is not None and shap_df is not None and X_env is not None:
                         s = shap_mean_abs.sort_values(ascending=True)
                         fig = plt.figure(figsize=(8.8, 5.4)); ax = fig.add_subplot(111)
@@ -1938,7 +2066,7 @@ def run_walkforward_once(
                                 ax.set_title(f"Dependence plot SHAP, {feat}, somente variavel ambiental ou meteorologica")
                                 ax.set_xlabel(feat)
                                 ax.set_ylabel(f"SHAP de {feat}")
-                                saved_figs.append(save_fig(fig, fig_dir, f"fig3{1+rank}_shap_dependence_top{rank}_only_raw_env"))
+                                saved_figs.append(save_fig(fig, fig_dir, f"fig{31 + rank}_shap_dependence_top{rank}_only_raw_env"))
             except Exception as e:
                 print("Aviso: explainability falhou, seguindo sem interromper.", e)
 
@@ -1956,19 +2084,19 @@ def run_walkforward_once(
             print("Total de figuras:", len(saved_figs))
 
             # ----------------------------------------------------
-            # NOVO: figuras suplementares (34 a 47)
+            # Figuras 34 a 47, caracterizacao e diagnostico
             # ----------------------------------------------------
             try:
                 build_supplementary_figures(
                     df_bt=df_bt,
                     pred_all=pred_all,
-                    results_df=results_df,
                     cfg=cfg,
                     y_all=y_all,
                     fig_dir=fig_dir,
+                    artifacts=artifacts_env,
                 )
             except Exception as e:
-                print("Aviso: figuras suplementares falharam, seguindo:", e)
+                print("Aviso: figuras de caracterizacao falharam, seguindo:", e)
 
     return {
         "results_df": results_df,
@@ -1984,11 +2112,118 @@ def run_walkforward_once(
 # ============================================================
 
 
-def main():
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pipeline_walkforward.py",
+        description=(
+            "Previsao diaria de internacoes respiratorias em Sao Paulo com modelo "
+            "hibrido ElasticNet mais CatBoost e validacao walk-forward."
+        ),
+    )
+    parser.add_argument(
+        "--data",
+        default=EXCEL_PATH,
+        help="Caminho do arquivo .xlsx com a serie diaria. Padrao, data/dataset_sp_2017_2022.xlsx",
+    )
+    parser.add_argument(
+        "--sheet",
+        default=SHEET_NAME,
+        help="Nome da aba da planilha. Padrao, data_clean",
+    )
+    parser.add_argument(
+        "--outdir",
+        default=OUTPUT_ROOT,
+        help="Pasta raiz onde a execucao sera gravada. Padrao, outputs/",
+    )
+    parser.add_argument(
+        "--target",
+        default=TARGET_COL,
+        help="Coluna alvo. Padrao, HOSPCIDX",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=RANDOM_SEED,
+        help="Semente aleatoria. Padrao, 42",
+    )
+    parser.add_argument(
+        "--test-start",
+        default=TEST_START,
+        help="Primeiro dia do periodo de teste walk-forward. Padrao, 2018-01-01",
+    )
+    parser.add_argument(
+        "--test-end",
+        default=TEST_END,
+        help="Ultimo dia do periodo de teste. Padrao, ultimo dia disponivel",
+    )
+    parser.add_argument(
+        "--fold-months",
+        type=int,
+        default=FOLD_MONTHS,
+        help="Tamanho de cada janela de teste em meses. Padrao, 2",
+    )
+    parser.add_argument(
+        "--no-figs",
+        action="store_true",
+        help="Executa o walk-forward sem gerar as figuras, util para testes rapidos.",
+    )
+    parser.add_argument(
+        "--run-hpo",
+        action="store_true",
+        help=(
+            "Ativa a busca bayesiana de hiperparametros com Optuna. Desligada por "
+            "padrao. A execucao reportada na tese usou a configuracao curada."
+        ),
+    )
+    parser.add_argument(
+        "--no-timestamp",
+        action="store_true",
+        help="Grava sempre na mesma pasta de saida, sem carimbo de data e hora.",
+    )
+    return parser.parse_args(argv)
+
+
+def apply_args(args: argparse.Namespace) -> None:
+    """Sobrescreve as constantes de configuracao com os argumentos da linha de comando."""
+    global EXCEL_PATH, SHEET_NAME, OUTPUT_ROOT, TARGET_COL, RANDOM_SEED
+    global TEST_START, TEST_END, FOLD_MONTHS, RUN_HPO, USE_TIMESTAMP_RUNFOLDER
+    global FINAL_ENSEMBLE_SEEDS
+
+    EXCEL_PATH = str(args.data)
+    SHEET_NAME = args.sheet
+    OUTPUT_ROOT = str(args.outdir)
+    TARGET_COL = str(args.target)
+    RANDOM_SEED = int(args.seed)
+    TEST_START = args.test_start
+    TEST_END = args.test_end
+    FOLD_MONTHS = int(args.fold_months)
+    RUN_HPO = bool(args.run_hpo)
+    USE_TIMESTAMP_RUNFOLDER = not bool(args.no_timestamp)
+
+    # Mantem as sementes do ensemble coerentes com --seed. Com o padrao 42 o
+    # resultado e [42, 52], identico a configuracao reportada.
+    FINAL_ENSEMBLE_SEEDS = [RANDOM_SEED, RANDOM_SEED + 10]
+
+    np.random.seed(RANDOM_SEED)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    apply_args(args)
+
     t0 = time.time()
 
     if not HAVE_CATBOOST:
-        raise RuntimeError("CatBoost nao foi carregado. Instale com: pip install catboost")
+        raise RuntimeError(
+            "CatBoost nao foi carregado. Instale com 'pip install catboost' "
+            "ou 'pip install -r requirements.txt'."
+        )
+
+    if RUN_HPO and not HAVE_OPTUNA:
+        raise RuntimeError(
+            "A busca de hiperparametros foi solicitada mas o Optuna nao esta instalado. "
+            "Instale com 'pip install optuna' ou execute sem --run-hpo."
+        )
 
     df_bt_raw = load_raw_df()
 
@@ -2006,7 +2241,7 @@ def main():
         print("... total de folds:", len(folds))
 
     if RUN_HPO:
-        print("\nHPO leve ativado.")
+        print("\nBusca bayesiana de hiperparametros ativada.")
         hpo = run_optuna_hpo(df_bt_raw, folds)
         best_cfg = CURATED_CFG.copy()
         if hpo.get("best_cfg") is not None:
@@ -2017,10 +2252,10 @@ def main():
         print(json.dumps(best_cfg, ensure_ascii=False, indent=2))
     else:
         best_cfg = CURATED_CFG.copy()
-        print("\nUsando configuracao curada, baseada no GPT3 vencedor, com melhorias cirurgicas.")
+        print("\nUsando a configuracao curada CURATED_CFG, mesma configuracao reportada na tese.")
         print(json.dumps(best_cfg, ensure_ascii=False, indent=2))
 
-    out_dir = build_out_dir(tag="FINAL_SURGICAL_ENV_ONLY")
+    out_dir = build_out_dir(tag="final")
     ensure_dir(out_dir)
 
     with open(os.path.join(out_dir, "run_summary.json"), "w", encoding="utf-8") as f:
@@ -2044,7 +2279,7 @@ def main():
         folds=folds,
         trial=None,
         out_dir=out_dir,
-        make_figs=True,
+        make_figs=not args.no_figs,
         mode="final",
     )
 
