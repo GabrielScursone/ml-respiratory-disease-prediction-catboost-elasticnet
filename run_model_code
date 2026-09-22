@@ -26,7 +26,8 @@ Fontes de dados
     variaveis meteorologicas.
 
 Uso
-    python src/pipeline_walkforward.py --data data/dataset_sp_2017_2022.xlsx
+    Jupyter: execute este arquivo com %run pipeline_walkforward_tese_jupyter_github.py
+    Terminal: python pipeline_walkforward_tese_jupyter_github.py --data caminho/para/dataset.xlsx
 
 Autor
     Gabriel Fuscald Scursone
@@ -137,9 +138,15 @@ except ImportError:
 # 1) CONFIG
 # ============================================================
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# Localizacao do projeto.
+# Em um arquivo .py, usa a pasta do proprio script.
+# No Jupyter Notebook, onde __file__ nao existe, usa a pasta de trabalho atual.
+try:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+except NameError:
+    SCRIPT_DIR = Path.cwd()
 
-# Funciona com o script dentro de src/ ou direto na raiz do repositorio.
+# Funciona com o script dentro de src/, na raiz do repositorio ou no Jupyter.
 PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "src" else SCRIPT_DIR
 
 DEFAULT_DATA_NAME = "dataset_sp_2017_2022.xlsx"
@@ -162,15 +169,15 @@ def _resolve_default_data() -> str:
     return str(preferido)
 
 
-# Caminho padrao do conjunto de dados. Pode ser sobrescrito por --data.
-EXCEL_PATH = _resolve_default_data()
+# Caminho local usado para reproduzir a analise no computador do autor.
+# No GitHub, outros usuarios podem sobrescrever este caminho com --data.
+EXCEL_PATH = r"C:\Users\Usuario\Desktop\Excel dados final 0_ArPol_VarMet_Hosp_Mort_2017a2022_SP_CENARIO_COVID_ONDAS_TODOS_HOSP_MORT_CLEAN.xlsx"
 
-# Aba unica do arquivo. None faz o pandas ler a primeira aba.
-SHEET_NAME = "data_clean"
+# None = primeira aba da planilha. Isso evita erro caso o nome da aba mude.
+SHEET_NAME = None
 
-# Coluna de data declarada de forma explicita. Deixar None aciona a deteccao
-# automatica em guess_date_col, que e mantida apenas como plano de contingencia.
-DATE_COL = "Data"
+# None = detecta automaticamente a coluna de data.
+DATE_COL = None
 
 # Alvo. Capitulo X da CID-10, doencas do aparelho respiratorio.
 TARGET_COL = "HOSPCIDX"
@@ -621,8 +628,8 @@ def load_raw_df() -> pd.DataFrame:
     if not os.path.exists(EXCEL_PATH):
         raise FileNotFoundError(
             f"Conjunto de dados nao encontrado em '{EXCEL_PATH}'.\n"
-            "Informe o caminho com --data, por exemplo:\n"
-            "    python pipeline_walkforward.py --data caminho/para/planilha.xlsx"
+            "Confira EXCEL_PATH no bloco CONFIG ou informe o caminho com --data.\n"
+            "Exemplo: python pipeline_walkforward_tese_jupyter_github.py --data caminho/para/planilha.xlsx"
         )
 
     print("Lendo arquivo:", EXCEL_PATH)
@@ -2293,4 +2300,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    # O kernel do Jupyter adiciona argumentos proprios em sys.argv.
+    # Passar [] evita que o argparse tente interpretar esses argumentos.
+    if "ipykernel" in sys.modules:
+        main([])
+    else:
+        main()
