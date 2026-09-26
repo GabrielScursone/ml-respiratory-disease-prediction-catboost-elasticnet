@@ -1,0 +1,13 @@
+# Dependencias do painel Streamlit (dashboard/app.py)
+# Instale com  pip install -r dashboard/requirements.txt
+
+streamlit>=1.64
+pandas>=2.2
+numpy>=1.26
+plotly>=5.22
+
+# Linha de tendencia do grafico de dispersao da aba Ambiente
+statsmodels>=0.14
+
+# Leitura da planilha opcional em data/
+openpyxl>=3.1
