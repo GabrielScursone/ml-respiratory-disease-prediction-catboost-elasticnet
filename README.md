@@ -1,5 +1,7 @@
 # Previsão diária de internações por doenças respiratórias em São Paulo
 
+[![Abrir no Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://internacoes-respiratorias-sp-2017-2022-elasticnet-catboost.streamlit.app/)
+
 Código, dados e resultados da tese de doutorado em Modelagem Computacional
 desenvolvida na Universidade Federal do Rio Grande (FURG).
 
@@ -10,6 +12,20 @@ a partir de variáveis de poluição do ar e de meteorologia.
 **Autor** Gabriel Fuscald Scursone
 **Orientadora** Dra. Diana Francisca Adamatti
 **Programa** Pós-Graduação em Modelagem Computacional, FURG
+
+---
+
+## Dashboard interativo
+
+Os resultados da validação walk-forward podem ser explorados num painel
+interativo publicado no Streamlit Community Cloud, sem instalar nada.
+
+**Acesse:** https://internacoes-respiratorias-sp-2017-2022-elasticnet-catboost.streamlit.app/
+
+O painel mostra a série diária observada e prevista, os dias em que o observado
+passou da faixa esperada, o desempenho do modelo em cada janela e em cada ano e
+a contribuição das variáveis ambientais pelo SHAP. O código está na pasta
+[`dashboard/`](dashboard/), que também explica como executá-lo localmente.
 
 ---
 
@@ -70,6 +86,10 @@ precipitação, radiação, velocidade do vento e pressão atmosférica.
 │   └── pdf/                        vetorial
 ├── docs/
 │   └── mapa_de_nomes.md            correspondência entre nomes antigos e novos
+├── dashboard/
+│   ├── app.py                      painel interativo em Streamlit
+│   ├── requirements.txt            dependências do painel
+│   └── README.md                   como usar e executar o painel
 ├── requirements.txt
 ├── LICENSE
 └── .gitignore

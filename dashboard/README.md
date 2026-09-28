@@ -4,6 +4,8 @@ Painel interativo em Streamlit com os resultados da validação walk-forward do
 modelo híbrido ElasticNet + CatBoost. O painel lê os arquivos de `results/` e de
 `config/` deste repositório e não treina nenhum modelo.
 
+**Painel publicado:** https://internacoes-respiratorias-sp-2017-2022-elasticnet-catboost.streamlit.app/
+
 ## O que o painel mostra
 
 - A série diária observada e prevista, com uma faixa de variação esperada e os
@@ -35,11 +37,13 @@ ocultas e o restante do painel funciona normalmente.
 
 ## Publicar no Streamlit Community Cloud
 
+O painel já está publicado no endereço indicado no início desta página. Para
+publicar uma cópia própria:
+
 1. Entre em https://share.streamlit.io com a conta do GitHub.
 2. Crie um app a partir deste repositório, com a branch `main` e o arquivo
    principal `dashboard/app.py`.
-3. Escolha o endereço do app, por exemplo `internacoes-respiratorias-sp`, e
-   confirme o deploy.
+3. Escolha o endereço do app e confirme o deploy.
 
 O Community Cloud instala as dependências de `dashboard/requirements.txt` e
 atualiza o painel a cada novo commit na branch escolhida.
